@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Intrinsics, Frames, and Pose Primer</title>
+  <style>
+    :root {
+      --bg: #0a1022;
+      --bg-soft: #101a36;
+      --card: #152246;
+      --text: #e9efff;
+      --muted: #a9b7de;
+      --accent: #73d5ff;
+      --accent-2: #9effc5;
+      --border: #27406f;
+      --code: #0d162f;
+      --warn: #ffd987;
+      --danger: #ffa1a1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      background: linear-gradient(130deg, #080d1d 0%, #0e1a39 45%, #0b132b 100%);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 28px 20px 80px;
+    }
+    .hero, .card {
+      background: var(--bg-soft);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+    }
+    .hero {
+      padding: 24px;
+      margin-bottom: 16px;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+    }
+    h1, h2, h3 { margin: 0 0 10px; line-height: 1.2; }
+    h1 { font-size: 2rem; }
+    h2 {
+      margin-top: 28px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      color: var(--accent);
+      font-size: 1.42rem;
+    }
+    h3 { margin-top: 16px; color: #cce2ff; font-size: 1.1rem; }
+    p { margin: 8px 0; }
+    .muted { color: var(--muted); }
+    .pill {
+      display: inline-block;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 4px 9px;
+      margin: 4px 6px 0 0;
+      font-size: 0.84rem;
+      color: var(--muted);
+      background: rgba(255,255,255,0.02);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .card h3 { margin-top: 0; }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    pre {
+      background: var(--code);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 11px;
+      overflow-x: auto;
+      color: #d6e4ff;
+      margin: 10px 0 14px;
+    }
+    ul, ol { margin-top: 6px; }
+    li { margin: 6px 0; }
+    .callout {
+      border-left: 3px solid var(--accent-2);
+      background: rgba(158,255,197,0.08);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin: 12px 0;
+    }
+    .warning {
+      border-left-color: var(--warn);
+      background: rgba(255,217,135,0.09);
+    }
+    .danger {
+      border-left-color: var(--danger);
+      background: rgba(255,161,161,0.1);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+      border: 1px solid var(--border);
+      background: var(--card);
+    }
+    th, td {
+      border-bottom: 1px solid var(--border);
+      padding: 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: rgba(255,255,255,0.03); color: #d9e8ff; }
+    tr:last-child td { border-bottom: none; }
+    .small { font-size: 0.92rem; color: var(--muted); }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section class="hero">
+      <h1>From Pixels to World Coordinates: A First-Principles Primer</h1>
+      <p class="muted">
+        This document focuses deeply on intrinsics, unprojection, frame synchronization, and pose composition.
+        It starts from basic definitions and builds toward robotics-grade understanding.
+      </p>
+      <span class="pill">Viewport</span>
+      <span class="pill">Pixels</span>
+      <span class="pill">Intrinsics</span>
+      <span class="pill">Depth</span>
+      <span class="pill">Pose</span>
+      <span class="pill">Synchronization</span>
+    </section>
+
+    <h2>0) The Most Basic Building Blocks</h2>
+    <h3>What is a viewport?</h3>
+    <p>
+      In rendering and vision, the <strong>viewport</strong> is the 2D pixel grid where an image appears.
+      If your RGB frame is <code>W x H</code>, then valid pixel coordinates are:
+    </p>
+    <pre>u in [0, W-1], v in [0, H-1]</pre>
+    <p>
+      Here <code>u</code> is horizontal (x-like), and <code>v</code> is vertical (y-like).
+    </p>
+
+    <h3>What is a pixel coordinate?</h3>
+    <p>
+      A pixel coordinate <code>(u, v)</code> is an address in the image plane, not a real-world location.
+      To recover 3D meaning, you must combine pixel location with camera model and depth.
+    </p>
+
+    <h3>What is a camera coordinate frame?</h3>
+    <p>
+      The camera frame is a 3D coordinate system attached to the camera itself.
+      A 3D point in this frame is <code>P_cam = [X, Y, Z]^T</code>.
+    </p>
+    <ul>
+      <li><code>Z</code>: distance along camera viewing direction.</li>
+      <li><code>X, Y</code>: lateral/vertical offsets from optical axis.</li>
+    </ul>
+
+    <h3>Many planes confusion: what to keep, what to ignore</h3>
+    <p>
+      In real devices there are many physical surfaces (lens cover glass, lens stack, phone display, laptop display),
+      but for vision geometry you should keep only three model entities:
+    </p>
+    <ol>
+      <li><strong>Camera center</strong> (pinhole origin in the model).</li>
+      <li><strong>Image/sensor plane</strong> (pixel grid where <code>u, v</code> and <code>cx, cy</code> live).</li>
+      <li><strong>3D scene point</strong> (where <code>X, Y, Z</code> live).</li>
+    </ol>
+    <div class="callout">
+      Phone screen and external monitor are display surfaces only; they are not geometric planes in the camera projection equations.
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Lives in</th>
+          <th>Meaning</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>u, v</code></td>
+          <td>Image/sensor plane</td>
+          <td>Observed pixel coordinates</td>
+        </tr>
+        <tr>
+          <td><code>cx, cy</code></td>
+          <td>Image/sensor plane</td>
+          <td>Principal point (optical axis intersection in pixels)</td>
+        </tr>
+        <tr>
+          <td><code>fx, fy</code></td>
+          <td>Camera calibration parameters</td>
+          <td>Pixel-space focal scales for x/y</td>
+        </tr>
+        <tr>
+          <td><code>z</code></td>
+          <td>Camera 3D frame</td>
+          <td>Depth along optical axis</td>
+        </tr>
+        <tr>
+          <td><code>X, Y, Z</code></td>
+          <td>Camera 3D frame</td>
+          <td>3D point coordinates in camera space</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="small">
+      Practical bridge: pixel offset chooses the ray, depth chooses where on that ray the 3D point lies.
+    </p>
+
+    <h2>1) What Hardware Is Sending You</h2>
+    <p>
+      For each capture instant, your iPhone + Record3D stack provides a packet with several fields:
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>Field</th>
+          <th>Data Type / Shape (typical)</th>
+          <th>Meaning</th>
+          <th>Real-world interpretation</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>rgb</code></td>
+          <td>Image array, e.g., <code>H x W x 3</code></td>
+          <td>Color intensity per pixel</td>
+          <td>Appearance/semantics: what object is there</td>
+        </tr>
+        <tr>
+          <td><code>depth</code></td>
+          <td>Image array, e.g., <code>H x W</code></td>
+          <td>Distance estimate per pixel</td>
+          <td>Geometry: where surfaces are in 3D</td>
+        </tr>
+        <tr>
+          <td><code>confidence</code></td>
+          <td>Image array, e.g., <code>H x W</code></td>
+          <td>Quality of each depth pixel</td>
+          <td>Uncertainty: how much to trust depth</td>
+        </tr>
+        <tr>
+          <td><code>intrinsics</code></td>
+          <td><code>fx, fy, cx, cy</code> (your code uses <code>tx, ty</code> for <code>cx, cy</code>)</td>
+          <td>Mapping between 3D camera rays and 2D pixels</td>
+          <td>Scale and center needed for all geometry math</td>
+        </tr>
+        <tr>
+          <td><code>camera_pose</code></td>
+          <td>Quaternion + translation</td>
+          <td>Camera orientation and position in world frame</td>
+          <td>Lets you fuse many frames into one map</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout warning">
+      Depth unit can be meters or another scale depending on API and pipeline settings.
+      Always verify with a known measured target distance.
+    </div>
+
+    <h2>1.1) What Is Verified from Library Source</h2>
+    <p>
+      The following points are verified directly from the Record3D C++/Python binding code in <code>libs</code>:
+    </p>
+    <ul>
+      <li>Each incoming packet contains RGB/depth/confidence dimensions, payload sizes, and device type.</li>
+      <li>The parser reads data in this order: header -> intrinsics -> camera pose -> RGB -> depth -> confidence -> optional misc buffer.</li>
+      <li><code>depth</code> is exposed to Python as <code>float32</code> 2D array.</li>
+      <li><code>rgb</code> is exposed as <code>uint8</code> array with 3 channels.</li>
+      <li><code>confidence</code> is exposed as <code>uint8</code> 2D array.</li>
+      <li>Intrinsic coefficients are exactly <code>fx, fy, tx, ty</code>.</li>
+      <li>Pose fields are exactly quaternion <code>qx, qy, qz, qw</code> and translation <code>tx, ty, tz</code>.</li>
+      <li>Device types are <code>0 = FaceID/TrueDepth</code>, <code>1 = LiDAR</code>.</li>
+      <li>API docs explicitly describe camera pose as being in world space.</li>
+    </ul>
+    <div class="callout warning">
+      Not verified in this binding: an explicit timestamp field and the exact depth unit label. Treat depth scale as a runtime calibration step.
+    </div>
+
+    <h2>1.2) iPhone 16 Pro Example (Concrete Interpretation)</h2>
+    <p>
+      Since you are using an iPhone 16 Pro, interpret each packet with this practical model:
+    </p>
+    <ul>
+      <li><strong>Rear camera workflow:</strong> expect LiDAR mode for environment geometry (<code>deviceType = 1</code>).</li>
+      <li><strong>Front camera workflow:</strong> expect TrueDepth/FaceID mode (<code>deviceType = 0</code>), often mirrored in demos for intuitive display.</li>
+      <li><strong>RGB:</strong> textured appearance for detection/classification.</li>
+      <li><strong>Depth:</strong> per-pixel surface distance estimate for geometry.</li>
+      <li><strong>Confidence:</strong> quality class per depth pixel (<code>0/1/2</code> in this library docs/comments).</li>
+      <li><strong>Pose:</strong> camera orientation and translation in world space, used to accumulate multi-frame maps.</li>
+    </ul>
+    <h3>Same data, two operating styles on iPhone 16 Pro</h3>
+    <div class="grid">
+      <div class="card">
+        <h3>Indoor robotics mapping (recommended)</h3>
+        <p>
+          Use rear LiDAR stream. Fuse depth points into a world map, confidence-gate noisy regions, and use pose to accumulate over motion.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Near-user interaction</h3>
+        <p>
+          Use front TrueDepth stream for short-range geometry and interaction tasks. Mirror correction may be needed for display only.
+        </p>
+      </div>
+    </div>
+    <div class="callout">
+      For your robotics stack on iPhone 16 Pro, default to rear LiDAR packets, and treat front TrueDepth as a different operating mode with its own intrinsics and frame behavior.
+    </div>
+
+    <h2>2) Intrinsics and Coefficients: Camera Matrix You Build</h2>
+    <p>
+      Your coefficients are converted into:
+    </p>
+    <pre>K = [[fx,  0, cx],
+     [ 0, fy, cy],
+     [ 0,  0,  1]]</pre>
+    <p>
+      This matrix is the pinhole camera model in pixel units.
+    </p>
+    <ul>
+      <li><code>fx</code>, <code>fy</code>: focal length along x/y measured in pixels.</li>
+      <li><code>cx</code>, <code>cy</code>: principal point (where optical axis intersects image plane).</li>
+      <li>In your code <code>tx/ty</code> are used as principal point terms.</li>
+    </ul>
+    <h3>Projection (3D -> pixel)</h3>
+    <pre>[u]     [fx 0  cx] [X/Z]
+[v]  =  [0  fy cy] [Y/Z]
+[1]     [0  0  1 ] [1  ]</pre>
+    <h3>Intuition</h3>
+    <ul>
+      <li>Higher <code>fx</code> means stronger zoom in x-direction.</li>
+      <li>If <code>cx, cy</code> are wrong, all 3D reconstruction is biased sideways.</li>
+      <li>Using wrong intrinsics is equivalent to using the wrong ruler and origin.</li>
+    </ul>
+    <div class="callout">
+      <strong>Notation and camera model notes:</strong>
+      <ul>
+        <li><code>^T</code> means transpose. Example: <code>[X, Y, Z]^T</code> is a column vector.</li>
+        <li><code>fx</code> and <code>fy</code> can differ due to calibration, resampling/cropping, and effective pixel scaling in the imaging pipeline.</li>
+        <li>Do not force <code>fx == fy</code> unless your calibration explicitly supports that constraint.</li>
+      </ul>
+    </div>
+
+    <h2>3) Unprojection Equation (Pixel + Depth -> Camera 3D)</h2>
+    <p>
+      If you know a pixel and its depth, you can recover 3D coordinates in camera space:
+    </p>
+    <pre>Given pixel (u, v), depth z:
+X = (u - cx) * z / fx
+Y = (v - cy) * z / fy
+Z = z
+
+P_cam = [X, Y, Z]^T</pre>
+    <h3>Geometric meaning</h3>
+    <ul>
+      <li><code>(u - cx)/fx</code> and <code>(v - cy)/fy</code> give a normalized camera ray direction.</li>
+      <li>Multiplying by depth <code>z</code> scales that ray to an actual 3D point.</li>
+      <li>Do this for all pixels with valid depth -> dense point cloud.</li>
+    </ul>
+    <div class="callout">
+      In robotics this is the bridge from image-space perception to physically actionable geometry.
+    </div>
+
+    <h2>4) Frames, Synchronization, and Why It Matters</h2>
+    <h3>What is a frame?</h3>
+    <p>
+      A frame is one snapshot at one time <code>t</code>. In RGB-D systems you usually want:
+      <code>rgb(t), depth(t), confidence(t), pose(t), intrinsics(t)</code> aligned to the same time.
+    </p>
+
+    <h3>Why synchronization matters</h3>
+    <p>
+      If RGB and depth come from slightly different times while camera/object moves, the same pixel no longer corresponds
+      to the same physical surface point. This creates 3D errors, wrong object distances, and unstable mapping.
+    </p>
+    <pre>Bad case:
+  rgb from t0
+  depth from t0 + dt
+  pose from t0 + 2dt
+  --> inconsistent geometry
+
+Good case:
+  coherent packet from same timestamp window
+  --> stable 3D interpretation</pre>
+    <h3>Practical synchronization model</h3>
+    <ul>
+      <li>Attach timestamp to each sensor channel.</li>
+      <li>Use bounded queue and choose nearest timestamp match.</li>
+      <li>Drop stale packets if processing lags.</li>
+      <li>Measure end-to-end latency and frame age continuously.</li>
+    </ul>
+
+    <h2>5) Coordinate Frames and Pose Composition</h2>
+    <h3>Core coordinate systems</h3>
+    <ul>
+      <li><strong>Image frame:</strong> pixel coordinates <code>(u, v)</code>.</li>
+      <li><strong>Camera frame:</strong> local 3D coordinates <code>(X, Y, Z)</code> tied to lens/sensor.</li>
+      <li><strong>World frame:</strong> persistent global reference used for maps and robot planning.</li>
+    </ul>
+
+    <h3>Pose format from hardware</h3>
+    <ul>
+      <li>Quaternion <code>(qx, qy, qz, qw)</code> encodes camera orientation.</li>
+      <li>Translation <code>(tx, ty, tz)</code> encodes camera position in world coordinates.</li>
+      <li>Together they define rigid transform <code>T_world_cam</code>.</li>
+    </ul>
+    <pre>P_world = R_world_cam * P_cam + t_world_cam</pre>
+    <p>
+      So once you unproject a depth pixel into <code>P_cam</code>, pose lets you place that point in a global map.
+    </p>
+
+    <h3>Composition with AprilTags (preview)</h3>
+    <pre>T_world_tag = T_world_cam * T_cam_tag</pre>
+    <p>
+      This equation anchors detected tags into world space and is the basis for map alignment, relocalization, and robot coordinate handoff.
+    </p>
+
+    <h2>6) What These Values Mean in the Real World</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>Frames</h3>
+        <p>
+          A frame is a measurement event. For robotics control, frame age (latency) matters as much as frame rate.
+          Old but high-fps data can still destabilize control.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Pose</h3>
+        <p>
+          Pose tells where the camera is and how it is rotated. If pose drifts, your world map drifts.
+          If pose jumps, your map can tear unless smoothed and validated.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Synchronization</h3>
+        <p>
+          Synchronization tells if each data field refers to the same moment. Poor sync causes geometry mismatch
+          and wrong distances, especially during motion.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Intrinsics</h3>
+        <p>
+          Intrinsics are your camera ruler and center offset. If they are wrong, every 3D coordinate you compute is systematically wrong.
+        </p>
+      </div>
+    </div>
+
+    <h2>7) Minimal Mental Model to Keep Forever</h2>
+    <ol>
+      <li>Pixel <code>(u,v)</code> alone is 2D address, not a 3D point.</li>
+      <li>Add depth <code>z</code> and intrinsics <code>K</code> -> you get <code>P_cam</code>.</li>
+      <li>Add pose <code>T_world_cam</code> -> you get <code>P_world</code>.</li>
+      <li>Do this at every synchronized frame -> you get a stable 3D map over time.</li>
+    </ol>
+    <div class="callout danger">
+      Most major RGB-D bugs are either (1) wrong units, (2) wrong transform direction, or (3) unsynchronized channels.
+    </div>
+
+    <p class="small">
+      Related guide: <a href="./vision_iphone_depth_guide.html">vision_iphone_depth_guide.html</a>
+    </p>
+    <p class="small">
+      Execution spec for your iPhone 16 Pro + myCobot280 task:
+      <a href="./robot_pick_pour_implementation_spec.md">robot_pick_pour_implementation_spec.md</a>
+    </p>
+  </div>
+</body>
+</html>
