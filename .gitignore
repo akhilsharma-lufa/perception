@@ -1,3 +1,5 @@
 .venv
 libs
 libs/*
+__pycache__/
+*.pyc
