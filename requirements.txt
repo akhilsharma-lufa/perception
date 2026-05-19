@@ -2,3 +2,4 @@ numpy
 record3d
 opencv-python
 ultralytics
+pupil-apriltags

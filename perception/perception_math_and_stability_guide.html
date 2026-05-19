@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Perception Math and Stability Guide</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      margin: 0;
+      padding: 24px;
+      line-height: 1.5;
+      background: #0b0d12;
+      color: #e6e8ee;
+    }
+    h1, h2, h3 { color: #ffffff; }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #151927;
+      border-radius: 6px;
+    }
+    code { padding: 2px 6px; }
+    pre {
+      padding: 12px;
+      overflow-x: auto;
+      border: 1px solid #2a314d;
+    }
+    .card {
+      background: #111523;
+      border: 1px solid #2a314d;
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin: 12px 0;
+    }
+    .ok { border-left: 4px solid #2ecc71; }
+    .warn { border-left: 4px solid #f39c12; }
+    .bad { border-left: 4px solid #e74c3c; }
+    ul { margin-top: 6px; }
+    .small { opacity: 0.9; font-size: 0.95em; }
+  </style>
+</head>
+<body>
+  <h1>Perception Math and Stability Guide</h1>
+  <p class="small">
+    Scope: current <code>perception</code> package in this repository. This document explains the core math,
+    linear algebra, camera geometry, calibration logic, and how multi-tag fusion improves stability.
+  </p>
+
+  <h2>1) Current Implementation Status (Important)</h2>
+  <div class="card ok">
+    <h3>Depth confidence usage</h3>
+    <p>
+      <strong>Current status:</strong> confidence frames are used in YOLO RGB-D localization to reject low-trust
+      depth pixels (<code>confidence &gt;= confidence_floor</code>) before 3D position estimation.
+      They are not yet used for AprilTag pose gating.
+    </p>
+  </div>
+  <div class="card warn">
+    <h3>Camera pose usage</h3>
+    <p>
+      <strong>Current status:</strong> camera pose is ingested into <code>FramePacket</code>, but the active
+      calibration/anchor solver does <strong>not yet fuse</strong> Record3D camera pose into the final
+      world estimate.
+    </p>
+  </div>
+  <div class="card">
+    <h3>What currently drives world coordinates</h3>
+    <ul>
+      <li>AprilTag detections and per-tag pose estimates from <code>pupil_apriltags</code>.</li>
+      <li>Profile map of <code>T_world_tag_i</code> built during bootstrap.</li>
+      <li>Per-frame candidate fusion to estimate <code>T_world_camera</code>.</li>
+    </ul>
+  </div>
+
+  <h2>2) Coordinate Frames and Transform Convention</h2>
+  <p>We use 4x4 homogeneous transforms in SE(3):</p>
+  <pre><code>T_A_B = transform from frame B to frame A
+p_A = T_A_B * p_B
+</code></pre>
+  <p>Core frames:</p>
+  <ul>
+    <li><code>camera</code>: iPhone optical frame</li>
+    <li><code>tag_i</code>: AprilTag local frame for id <code>i</code></li>
+    <li><code>world</code>: chosen as <code>tag1</code> frame (origin policy)</li>
+  </ul>
+
+  <h2>3) Camera Model and Projection Math</h2>
+  <p>Intrinsics matrix:</p>
+  <pre><code>K = [[fx, 0, cx],
+     [0, fy, cy],
+     [0,  0,  1]]
+</code></pre>
+  <p>Projection (<code>camera -> pixel</code>):</p>
+  <pre><code>u = fx * X / Z + cx
+v = fy * Y / Z + cy
+</code></pre>
+  <p>Unprojection (<code>pixel + depth -> camera</code>):</p>
+  <pre><code>X = (u - cx) * Z / fx
+Y = (v - cy) * Z / fy
+Z = depth
+</code></pre>
+  <div class="card warn">
+    <p>
+      If RGB and depth resolution differ, intrinsics must be scaled to target image resolution.
+      Otherwise one axis may appear wrong (common source of "one dimension off" bugs).
+    </p>
+  </div>
+
+  <h2>4) AprilTag Pose and Multi-Tag Fusion</h2>
+  <p>Given detections in one frame, each visible tag yields a camera pose candidate:</p>
+  <pre><code>T_world_camera_candidate(i) = T_world_tag_i * T_tag_i_camera
+where T_tag_i_camera = inverse(T_camera_tag_i)
+</code></pre>
+  <p>We fuse all candidates:</p>
+  <ul>
+    <li>Translation: arithmetic mean.</li>
+    <li>Rotation: SVD-based orthonormal projection (average matrix then re-orthogonalize).</li>
+  </ul>
+  <pre><code>R_blend = sum(R_i)
+[U, S, Vt] = svd(R_blend)
+R_fused = U * Vt
+if det(R_fused) &lt; 0: flip sign on last axis and recompute
+</code></pre>
+
+  <h2>5) Why 3 Tags Are More Stable Than 1 Tag</h2>
+  <div class="card ok">
+    <ul>
+      <li><strong>Redundancy:</strong> if one tag is partially occluded, others still anchor the frame.</li>
+      <li><strong>Noise averaging:</strong> independent pose noise cancels when fusing multiple tags.</li>
+      <li><strong>Better conditioning:</strong> non-collinear tag geometry reduces ambiguity under oblique views.</li>
+      <li><strong>Outlier detection:</strong> candidate disagreement exposes unstable solves.</li>
+    </ul>
+  </div>
+  <p>For your policy (<code>tag1</code> origin):</p>
+  <ul>
+    <li><code>tag1</code> defines world origin and axis reference.</li>
+    <li><code>tag2/tag3</code> primarily improve stability and continuity.</li>
+  </ul>
+
+  <h2>6) Stability Metrics and Events</h2>
+  <p>We compute residual spread between candidates:</p>
+  <pre><code>trans_rmse = sqrt(mean(||t_i - t_fused||^2))
+rot_rmse_deg = sqrt(mean(theta(R_i, R_fused)^2))
+</code></pre>
+  <p>Quality score is derived from residual thresholds:</p>
+  <pre><code>q_t = max(0, 1 - trans_rmse / trans_limit)
+q_r = max(0, 1 - rot_rmse / rot_limit)
+quality = 0.5 * (q_t + q_r)
+</code></pre>
+  <p>Main events:</p>
+  <ul>
+    <li><code>ANCHOR_UNSTABLE</code>: residual too large</li>
+    <li><code>ANCHOR_HOLD_LAST</code>: temporary tag loss, hold previous estimate</li>
+    <li><code>ANCHOR_LOST</code>: no usable anchor estimate</li>
+  </ul>
+
+  <h2>7) Practical Example (Your Tag Layout)</h2>
+  <p>Example session values in <code>tag1</code> frame:</p>
+  <pre><code>tag2 ~ (+0.118, -0.153, +0.007) m
+tag3 ~ (-0.076, -0.142, +0.004) m
+</code></pre>
+  <p>
+    If these numbers are wrong in one axis, likely causes:
+  </p>
+  <ul>
+    <li>tag size mismatch (<code>tag_size_m</code> incorrect)</li>
+    <li>intrinsics mismatch or wrong resolution mapping</li>
+    <li>lens distortion not modeled</li>
+    <li>insufficient viewpoint diversity during calibration</li>
+    <li>origin tag not visible (falling back to mapped values)</li>
+  </ul>
+
+  <h2>8) Photography Concepts That Matter</h2>
+  <ul>
+    <li><strong>FOV and distortion:</strong> wide lenses increase edge distortion; AprilTag corners become noisier near image boundaries.</li>
+    <li><strong>Motion blur:</strong> blurred corners degrade tag pose solve; keep shutter high with good lighting.</li>
+    <li><strong>Depth noise vs distance:</strong> depth variance grows with range and low-texture/reflective surfaces.</li>
+    <li><strong>Exposure consistency:</strong> avoid aggressive auto-exposure swings during calibration capture.</li>
+  </ul>
+
+  <h2>9) Linear Algebra Concepts Used</h2>
+  <ul>
+    <li>Homogeneous coordinates for rigid transforms.</li>
+    <li>Matrix inversion for frame reversal (<code>T^-1</code>).</li>
+    <li>SVD for nearest valid rotation matrix projection.</li>
+    <li>RMSE residuals for candidate spread and confidence estimation.</li>
+  </ul>
+
+  <h2>10) Recommended Next Improvements</h2>
+  <div class="card warn">
+    <ol>
+      <li>Use depth-confidence map to mask low-trust regions before object localization.</li>
+      <li>Fuse Record3D camera pose as a temporal prior between tag updates.</li>
+      <li>Add radial distortion calibration/compensation for improved axis accuracy.</li>
+      <li>Enforce direct-origin mode for coordinates when <code>tag1</code> is visible.</li>
+      <li>Log per-tag solve uncertainty and reject weak detections by margin threshold.</li>
+    </ol>
+  </div>
+
+  <p class="small">
+    File location: <code>perception/perception_math_and_stability_guide.html</code>
+  </p>
+</body>
+</html>

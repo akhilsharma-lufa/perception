@@ -1,0 +1,11 @@
+{
+  "description": "Transform from tag frame to robot base frame. Replace with calibrated values.",
+  "units": "meters",
+  "convention": "p_robot = T_robot_tag * p_tag",
+  "T_robot_tag": [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}
