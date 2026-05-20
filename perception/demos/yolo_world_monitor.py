@@ -1,5 +1,4 @@
 import argparse
-from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -13,8 +12,16 @@ from perception.calibration import (
 )
 from perception.detection import YoloDetection, YoloDetectorSettings, YoloObjectDetector
 from perception.detection.orientation import RotationCode, detect_orientation, rotate_to_upright
-from perception.localization import RgbdLocalizerSettings, localize_objects_rgbd
+from perception.localization import (
+    RgbdLocalizerSettings,
+    WorldTracker,
+    WorldTrackerSettings,
+    localize_objects_rgbd,
+)
 from perception.io import Record3DSource
+
+
+_DRIFT_WARN_THRESHOLD_M = 0.012  # 12 mm mean tag-to-tag drift starts to matter
 
 
 def _depth_to_colormap(depth: np.ndarray) -> np.ndarray:
@@ -86,71 +93,7 @@ def _draw_text_box(
         baseline_y += line_h + line_gap
 
 
-@dataclass
-class _ObjTrack:
-    object_id: str
-    label: str
-    position: np.ndarray
-    yaw: float | None
-    height_m: float | None
-    quality: float
-    missed: int = 0
-
-
-def _smooth_object_outputs(object_outputs, tracks: dict[str, _ObjTrack], alpha: float = 0.25):
-    alpha = float(np.clip(alpha, 0.0, 1.0))
-    seen_ids: set[str] = set()
-    smoothed = []
-
-    for obj in object_outputs:
-        oid = obj.object_id
-        seen_ids.add(oid)
-        p = np.asarray(obj.position_world_xyz_m, dtype=np.float64)
-        if oid not in tracks:
-            tracks[oid] = _ObjTrack(
-                object_id=oid,
-                label=obj.label,
-                position=p,
-                yaw=obj.gripper_yaw_hint_rad,
-                height_m=obj.height_m,
-                quality=float(obj.quality),
-                missed=0,
-            )
-        else:
-            tr = tracks[oid]
-            tr.position = (1.0 - alpha) * tr.position + alpha * p
-            if obj.gripper_yaw_hint_rad is not None and tr.yaw is not None:
-                tr.yaw = float((1.0 - alpha) * tr.yaw + alpha * obj.gripper_yaw_hint_rad)
-            elif obj.gripper_yaw_hint_rad is not None:
-                tr.yaw = float(obj.gripper_yaw_hint_rad)
-            else:
-                tr.yaw = None
-            tr.height_m = (
-                float((1.0 - alpha) * tr.height_m + alpha * obj.height_m)
-                if (tr.height_m is not None and obj.height_m is not None)
-                else (obj.height_m if obj.height_m is not None else tr.height_m)
-            )
-            tr.quality = float((1.0 - alpha) * tr.quality + alpha * float(obj.quality))
-            tr.missed = 0
-
-        tr = tracks[oid]
-        obj.position_world_xyz_m = (float(tr.position[0]), float(tr.position[1]), float(tr.position[2]))
-        obj.gripper_yaw_hint_rad = tr.yaw
-        obj.height_m = tr.height_m
-        obj.quality = tr.quality
-        smoothed.append(obj)
-
-    for oid, tr in tracks.items():
-        if oid not in seen_ids:
-            tr.missed += 1
-    stale = [oid for oid, tr in tracks.items() if tr.missed > 12]
-    for oid in stale:
-        tracks.pop(oid, None)
-
-    return smoothed
-
-
-def _draw_object_overlays(rgb_bgr: np.ndarray, detections, object_outputs):
+def _draw_object_overlays(rgb_bgr: np.ndarray, detections, output_by_det_idx):
     h, w = rgb_bgr.shape[:2]
 
     if not detections:
@@ -165,8 +108,6 @@ def _draw_object_overlays(rgb_bgr: np.ndarray, detections, object_outputs):
             cv2.LINE_AA,
         )
         return
-
-    obj_by_id = {obj.object_id: obj for obj in object_outputs}
 
     for idx, det in enumerate(detections):
         color = _OBJECT_COLORS[idx % len(_OBJECT_COLORS)]
@@ -185,10 +126,11 @@ def _draw_object_overlays(rgb_bgr: np.ndarray, detections, object_outputs):
         cx, cy = det.anchor_x, det.anchor_y
         cv2.circle(rgb_bgr, (cx, cy), 5, (0, 255, 255), -1, cv2.LINE_AA)
 
-        obj = obj_by_id.get(f"{det.label}_{idx}")
+        obj = output_by_det_idx.get(idx)
         x, y, bw, _ = cv2.boundingRect(mask)
         panel_lines = [f"{det.label} ({det.confidence:.0%})"]
         if obj is not None:
+            panel_lines[0] = f"{obj.object_id} ({det.confidence:.0%})"
             px, py, pz = obj.position_world_xyz_m
             panel_lines.append(f"({px:+.3f}, {py:+.3f}, {pz:+.3f}) m")
 
@@ -209,7 +151,6 @@ def _draw_object_overlays(rgb_bgr: np.ndarray, detections, object_outputs):
                     tipLength=0.3,
                 )
 
-        # Place the info panel above the detected object with high contrast.
         panel_x = int(x + bw * 0.5) - 90
         panel_y = max(6, y - 80)
         _draw_text_box(
@@ -266,6 +207,14 @@ def _rotate_detections_for_display(
     return rotated
 
 
+def _src_idx_from_object_id(object_id: str) -> int:
+    # localizer encodes detection index in object_id as "{label}_{src_idx}"
+    try:
+        return int(object_id.rsplit("_", 1)[-1])
+    except ValueError:
+        return -1
+
+
 def main():
     parser = argparse.ArgumentParser(description="YOLO + RGBD world monitor for cups.")
     parser.add_argument("--profile", default="calibration/profiles/session_multitag.json")
@@ -282,7 +231,9 @@ def main():
     parser.add_argument("--confidence-floor", type=int, default=1)
     parser.add_argument("--infer-every-n", type=int, default=1)
     parser.add_argument("--hold-frames", type=int, default=12)
-    parser.add_argument("--smooth-alpha", type=float, default=0.25)
+    parser.add_argument("--smooth-alpha", type=float, default=0.30)
+    parser.add_argument("--mask-erosion-px", type=int, default=3)
+    parser.add_argument("--match-distance-m", type=float, default=0.10)
     args = parser.parse_args()
 
     class_whitelist = None
@@ -312,8 +263,26 @@ def main():
             hold_frames=max(1, int(args.hold_frames)),
         )
     )
-    localizer_cfg = RgbdLocalizerSettings(confidence_floor=int(args.confidence_floor))
+    localizer_cfg = RgbdLocalizerSettings(
+        confidence_floor=int(args.confidence_floor),
+        mask_erosion_px=int(args.mask_erosion_px),
+    )
+    tracker = WorldTracker(
+        WorldTrackerSettings(
+            max_match_distance_m=float(args.match_distance_m),
+            position_alpha=float(args.smooth_alpha),
+            height_alpha=float(min(args.smooth_alpha, 0.25)),
+            yaw_alpha=float(args.smooth_alpha),
+            quality_alpha=float(args.smooth_alpha),
+        )
+    )
 
+    plane_status = "absent"
+    if profile.table_plane is not None:
+        plane_status = (
+            f"OK inliers={profile.table_plane.inlier_ratio:.2f} "
+            f"resid={profile.table_plane.mean_abs_residual_m * 1000:.1f}mm"
+        )
     source = Record3DSource()
     print(
         f"[perception] YOLO model={args.yolo_model} "
@@ -321,7 +290,13 @@ def main():
         f"infer_every_n={int(args.infer_every_n)} hold_frames={int(args.hold_frames)} "
         f"classes={class_whitelist if class_whitelist is not None else '*'}"
     )
-    object_tracks: dict[str, _ObjTrack] = {}
+    print(f"[perception] table_plane={plane_status}")
+    if profile.table_plane is None:
+        print(
+            "[perception] WARN: no table plane in profile. Heights will use ring-fallback "
+            "(noisier). Re-run auto_calibrate_tags to populate it."
+        )
+
     _last_rot_code = RotationCode.NONE
     source.connect(device_index=args.device_index)
     try:
@@ -332,18 +307,23 @@ def main():
 
             obs = calibrator.detect_tags(packet.rgb, packet.intrinsic_mat, packet.ts_monotonic)
             anchor = calibrator.estimate_world_camera(obs, profile)
-            _ = manager.evaluate_runtime_geometry_drift(obs, profile)
+            drift_m = manager.evaluate_runtime_geometry_drift(obs, profile)
 
             detections = detector.infer(packet.rgb, frame_id=packet.frame_id, camera_pose=packet.camera_pose)
-            object_outputs = localize_objects_rgbd(
+            raw_outputs = localize_objects_rgbd(
                 packet=packet,
                 detections=detections,
                 t_world_camera=anchor.t_world_camera,
                 settings=localizer_cfg,
+                table_plane=profile.table_plane,
             )
-            object_outputs = _smooth_object_outputs(
-                object_outputs, tracks=object_tracks, alpha=float(args.smooth_alpha)
-            )
+            src_indices = [_src_idx_from_object_id(o.object_id) for o in raw_outputs]
+            tracked_outputs = tracker.update(raw_outputs)
+            output_by_det_idx = {
+                src_indices[i]: tracked_outputs[i]
+                for i in range(len(tracked_outputs))
+                if 0 <= src_indices[i] < len(detections)
+            }
 
             rgb_bgr = cv2.cvtColor(packet.rgb, cv2.COLOR_RGB2BGR)
             depth_bgr = _depth_to_colormap(packet.depth)
@@ -383,14 +363,26 @@ def main():
                 src_w=packet.rgb.shape[1],
             )
 
-            _draw_object_overlays(rgb_display, detections_display, object_outputs)
+            _draw_object_overlays(rgb_display, detections_display, output_by_det_idx)
+            drift_status = "-"
+            drift_color = (255, 255, 255)
+            if drift_m > 0.0:
+                drift_status = f"{drift_m * 1000:.1f}mm"
+                if drift_m > _DRIFT_WARN_THRESHOLD_M:
+                    drift_color = (60, 80, 255)  # red-ish in BGR
+                    drift_status += " HIGH"
+            status_line = (
+                f"anchor={anchor.anchor_mode} q={anchor.quality:.2f} "
+                f"event={anchor.event if anchor.event else '-'} "
+                f"drift={drift_status} plane={'on' if profile.table_plane else 'off'}"
+            )
             cv2.putText(
                 rgb_display,
-                f"anchor={anchor.anchor_mode} quality={anchor.quality:.2f} event={anchor.event if anchor.event else '-'}",
+                status_line,
                 (12, rgb_display.shape[0] - 14),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
-                (255, 255, 255),
+                drift_color,
                 2,
                 cv2.LINE_AA,
             )

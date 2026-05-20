@@ -4,6 +4,7 @@ from .camera_model import (
     scale_intrinsics_for_shape,
     unproject_pixel,
 )
+from .plane_fit import PlaneFitResult, ransac_plane
 from .tf_tree import TimedTransform, TransformTree
 from .transforms import (
     average_rotations,
@@ -15,6 +16,7 @@ from .transforms import (
 
 __all__ = [
     "CameraIntrinsics",
+    "PlaneFitResult",
     "TimedTransform",
     "TransformTree",
     "average_rotations",
@@ -22,6 +24,7 @@ __all__ = [
     "invert_transform",
     "make_transform",
     "project_point",
+    "ransac_plane",
     "scale_intrinsics_for_shape",
     "transform_point",
     "unproject_pixel",

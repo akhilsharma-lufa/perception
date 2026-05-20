@@ -6,7 +6,7 @@ from .multitag_calibrator import (
     TagDetection,
     TagObservationFrame,
 )
-from .profiles import CalibrationProfile, CalibrationProfileIO
+from .profiles import CalibrationProfile, CalibrationProfileIO, TablePlane
 from .table_plane_validator import (
     TablePlaneValidationResult,
     validate_table_plane_consistency,
@@ -18,6 +18,7 @@ __all__ = [
     "AutoCalibrationSettings",
     "CalibrationProfile",
     "CalibrationProfileIO",
+    "TablePlane",
     "MultiTagCalibrator",
     "MultiTagCalibratorSettings",
     "TablePlaneValidationResult",

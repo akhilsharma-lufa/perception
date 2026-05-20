@@ -6,11 +6,9 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from perception.calibration.profiles import TablePlane
 from perception.detection import YoloDetection
-from perception.geometry import (
-    scale_intrinsics_for_shape,
-    transform_point,
-)
+from perception.geometry import scale_intrinsics_for_shape
 from perception.io.frame_packet import FramePacket
 from perception.output import ObjectPoseOutput
 
@@ -19,36 +17,129 @@ from perception.output import ObjectPoseOutput
 class RgbdLocalizerSettings:
     confidence_floor: int = 1
     min_depth_pixels: int = 24
+    mask_erosion_px: int = 3
+    object_top_percentile: float = 95.0
+    object_base_percentile: float = 5.0
+    centroid_percentile: float = 50.0
+    # Depth-consistency mask refinement: reject mask pixels whose camera-Z is
+    # too far BEHIND the cup's front surface. Anchored to the depth p5 of the
+    # mask (front of the cup) plus this allowance, so the cup's full body is
+    # preserved while distant background (laptop/wall behind the cup) is rejected.
+    depth_consistency_max_extent_m: float = 0.18
+    depth_consistency_front_percentile: float = 5.0
+    depth_consistency_min_keep_ratio: float = 0.40
+    # Fallback (no table plane) ring sampling for table_z estimate
+    table_ring_px: int = 8
+    min_table_ring_pixels: int = 40
 
 
-def _to_depth_mask(mask_rgb: np.ndarray, depth_shape: tuple[int, int]) -> np.ndarray:
+def _resize_mask_to_depth(mask_rgb: np.ndarray, depth_shape: tuple[int, int]) -> np.ndarray:
     dh, dw = depth_shape
-    resized = cv2.resize(mask_rgb.astype(np.float32), (dw, dh), interpolation=cv2.INTER_NEAREST)
-    return resized > 0.5
+    src = mask_rgb.astype(np.uint8)
+    if src.shape[:2] == (dh, dw):
+        return src > 0
+    resized = cv2.resize(src, (dw, dh), interpolation=cv2.INTER_NEAREST)
+    return resized > 0
 
 
-def _unproject_points(depth: np.ndarray, valid: np.ndarray, k_depth: np.ndarray) -> np.ndarray | None:
+def _erode_mask(mask: np.ndarray, px: int) -> np.ndarray:
+    px = int(max(0, px))
+    if px == 0:
+        return mask
+    kernel = np.ones((px * 2 + 1, px * 2 + 1), dtype=np.uint8)
+    eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=1)
+    return eroded > 0
+
+
+def _weighted_percentile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+    """Percentile interpolation with non-negative weights."""
+    v = np.asarray(values, dtype=np.float64).reshape(-1)
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if v.size == 0:
+        return float("nan")
+    if w.size != v.size:
+        w = np.ones_like(v)
+    order = np.argsort(v)
+    v_sorted = v[order]
+    w_sorted = np.clip(w[order], 0.0, None)
+    total = float(np.sum(w_sorted))
+    if total <= 0.0:
+        return float(np.percentile(v, q))
+    cw = np.cumsum(w_sorted)
+    target = (q / 100.0) * total
+    return float(np.interp(target, cw, v_sorted))
+
+
+def _unproject_valid(depth: np.ndarray, valid: np.ndarray, k_depth: np.ndarray) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
     ys, xs = np.where(valid)
     if ys.size == 0:
-        return None
+        return np.zeros((0, 3), dtype=np.float64), (ys, xs)
     z = depth[ys, xs].astype(np.float64)
     fx, fy = float(k_depth[0, 0]), float(k_depth[1, 1])
     cx, cy = float(k_depth[0, 2]), float(k_depth[1, 2])
     x = ((xs.astype(np.float64) - cx) * z) / fx
     y = ((ys.astype(np.float64) - cy) * z) / fy
-    return np.stack([x, y, z], axis=1)
+    return np.stack([x, y, z], axis=1), (ys, xs)
 
 
-def _yaw_from_points_xy(points_xy: np.ndarray) -> Optional[float]:
+def _camera_to_world(pts_cam: np.ndarray, t_world_camera: np.ndarray) -> np.ndarray:
+    if pts_cam.shape[0] == 0:
+        return pts_cam
+    r = np.asarray(t_world_camera[:3, :3], dtype=np.float64)
+    t = np.asarray(t_world_camera[:3, 3], dtype=np.float64).reshape(3)
+    return (pts_cam @ r.T) + t
+
+
+def _yaw_from_points_xy(points_xy: np.ndarray, weights: Optional[np.ndarray] = None) -> Optional[float]:
     if points_xy.shape[0] < 20:
         return None
-    c = np.mean(points_xy, axis=0, keepdims=True)
-    centered = points_xy - c
-    cov = centered.T @ centered / max(1, centered.shape[0] - 1)
+    pts = np.asarray(points_xy, dtype=np.float64)
+    if weights is not None and weights.size == pts.shape[0]:
+        w = np.clip(weights, 0.0, None)
+        wsum = float(np.sum(w))
+        if wsum <= 0:
+            c = np.mean(pts, axis=0)
+        else:
+            c = (w[:, None] * pts).sum(axis=0) / wsum
+        centered = pts - c
+        cov = (centered.T @ (centered * w[:, None])) / max(1.0, wsum)
+    else:
+        c = np.mean(pts, axis=0)
+        centered = pts - c
+        cov = centered.T @ centered / max(1, centered.shape[0] - 1)
     eigvals, eigvecs = np.linalg.eigh(cov)
-    idx = int(np.argmax(eigvals))
-    axis = eigvecs[:, idx]
+    if eigvals[-1] < 1e-9:
+        return None
+    ratio = float(eigvals[-1]) / max(float(eigvals[0]), 1e-9)
+    if ratio < 1.4:
+        return None
+    axis = eigvecs[:, int(np.argmax(eigvals))]
     return float(np.arctan2(axis[1], axis[0]))
+
+
+def _ring_table_z_fallback(
+    mask_depth: np.ndarray,
+    depth: np.ndarray,
+    k_depth: np.ndarray,
+    t_world_camera: Optional[np.ndarray],
+    ring_px: int,
+    min_ring_pixels: int,
+) -> Optional[float]:
+    ring_px = int(max(1, ring_px))
+    kernel = np.ones((ring_px * 2 + 1, ring_px * 2 + 1), dtype=np.uint8)
+    dilated = cv2.dilate(mask_depth.astype(np.uint8), kernel, iterations=1) > 0
+    ring = dilated & (~mask_depth)
+    valid_ring = ring & np.isfinite(depth) & (depth > 0.0)
+    if int(np.count_nonzero(valid_ring)) < int(min_ring_pixels):
+        return None
+    pts_cam, _ = _unproject_valid(depth, valid_ring, k_depth)
+    if pts_cam.shape[0] == 0:
+        return None
+    if t_world_camera is not None:
+        pts = _camera_to_world(pts_cam, t_world_camera)
+    else:
+        pts = pts_cam
+    return float(np.median(pts[:, 2]))
 
 
 def localize_objects_rgbd(
@@ -56,6 +147,7 @@ def localize_objects_rgbd(
     detections: list[YoloDetection],
     t_world_camera: np.ndarray | None,
     settings: Optional[RgbdLocalizerSettings] = None,
+    table_plane: Optional[TablePlane] = None,
 ) -> list[ObjectPoseOutput]:
     cfg = settings or RgbdLocalizerSettings()
     rgb_h, rgb_w = packet.rgb.shape[:2]
@@ -64,43 +156,106 @@ def localize_objects_rgbd(
         packet.intrinsic_mat, rgb_shape=(rgb_h, rgb_w), target_shape=(depth_h, depth_w)
     )
 
+    plane_normal: Optional[np.ndarray] = None
+    plane_origin: Optional[np.ndarray] = None
+    if table_plane is not None and t_world_camera is not None:
+        plane_normal, plane_origin = table_plane.as_arrays()
+
+    confidence_floor = int(cfg.confidence_floor)
+    finite_depth = np.isfinite(packet.depth) & (packet.depth > 0.0)
+    has_confidence = (
+        packet.confidence is not None and packet.confidence.shape == packet.depth.shape
+    )
+
     out: list[ObjectPoseOutput] = []
     for idx, det in enumerate(detections):
-        mask_depth = _to_depth_mask(det.mask_rgb, (depth_h, depth_w))
-        valid = mask_depth & np.isfinite(packet.depth) & (packet.depth > 0.0)
+        mask_depth_full = _resize_mask_to_depth(det.mask_rgb, (depth_h, depth_w))
+        mask_depth = _erode_mask(mask_depth_full, cfg.mask_erosion_px)
+        if not np.any(mask_depth):
+            mask_depth = mask_depth_full  # cup mask was too small to erode
 
-        # Confidence gating: this is the key quality improvement for depth-based object localization.
-        if packet.confidence is not None and packet.confidence.shape == packet.depth.shape:
-            valid &= packet.confidence >= int(cfg.confidence_floor)
+        valid = mask_depth & finite_depth
+        if has_confidence:
+            valid &= packet.confidence >= confidence_floor
 
         if int(np.count_nonzero(valid)) < int(cfg.min_depth_pixels):
             continue
 
-        pts_cam = _unproject_points(packet.depth, valid, k_depth)
-        if pts_cam is None or pts_cam.shape[0] < int(cfg.min_depth_pixels):
+        pts_cam, (ys, xs) = _unproject_valid(packet.depth, valid, k_depth)
+        if pts_cam.shape[0] < int(cfg.min_depth_pixels):
             continue
 
-        center_cam = np.median(pts_cam, axis=0)
+        # Depth-consistency refinement: drop mask pixels whose camera-Z is far
+        # behind the cup front. Kills "the cup mask leaked onto the laptop"
+        # cases where YOLO is permissive but only one depth surface is the cup.
+        if cfg.depth_consistency_max_extent_m > 0.0:
+            zs = pts_cam[:, 2]
+            z_front = float(np.percentile(zs, float(cfg.depth_consistency_front_percentile)))
+            z_max_allowed = z_front + float(cfg.depth_consistency_max_extent_m)
+            keep = zs <= z_max_allowed
+            keep_ratio = float(keep.sum()) / float(zs.size)
+            if (
+                keep.sum() >= int(cfg.min_depth_pixels)
+                and keep_ratio >= float(cfg.depth_consistency_min_keep_ratio)
+            ):
+                pts_cam = pts_cam[keep]
+                ys = ys[keep]
+                xs = xs[keep]
 
-        # det.yaw_hint_rad is None for symmetric objects (cup, bowl) -- skip yaw entirely
-        is_symmetric = det.yaw_hint_rad is None
-
-        if t_world_camera is not None:
-            pts_world = np.array([transform_point(t_world_camera, p) for p in pts_cam], dtype=np.float64)
-            center_world = np.median(pts_world, axis=0)
-            z_min = float(np.percentile(pts_world[:, 2], 5))
-            z_max = float(np.percentile(pts_world[:, 2], 95))
-            height_m = max(0.0, z_max - z_min)
-            position = (float(center_world[0]), float(center_world[1]), float(center_world[2]))
-            yaw_hint = None if is_symmetric else _yaw_from_points_xy(pts_world[:, :2])
+        if has_confidence:
+            w_per_pt = packet.confidence[ys, xs].astype(np.float64)
+            w_per_pt = np.clip(w_per_pt, 1.0, None)
         else:
-            z_min = float(np.percentile(pts_cam[:, 2], 5))
-            z_max = float(np.percentile(pts_cam[:, 2], 95))
-            height_m = max(0.0, z_max - z_min)
-            position = (float(center_cam[0]), float(center_cam[1]), float(center_cam[2]))
-            yaw_hint = None if is_symmetric else _yaw_from_points_xy(pts_cam[:, :2])
+            w_per_pt = np.ones(pts_cam.shape[0], dtype=np.float64)
 
-        quality = float(min(1.0, np.count_nonzero(valid) / max(500.0, det.mask_rgb.sum())))
+        in_world = t_world_camera is not None
+        pts = _camera_to_world(pts_cam, t_world_camera) if in_world else pts_cam
+
+        center_x = _weighted_percentile(pts[:, 0], w_per_pt, cfg.centroid_percentile)
+        center_y = _weighted_percentile(pts[:, 1], w_per_pt, cfg.centroid_percentile)
+        center_z = _weighted_percentile(pts[:, 2], w_per_pt, cfg.centroid_percentile)
+        position = (float(center_x), float(center_y), float(center_z))
+
+        height_m: Optional[float] = None
+        if plane_normal is not None and plane_origin is not None:
+            # With a known table plane, signed distance to plane IS height above table.
+            # The cup base sits on the table at signed_dist ~= 0; mask erosion may bias
+            # the cloud's low percentile upward, so trust the plane as the base reference.
+            signed = (pts - plane_origin) @ plane_normal
+            top = _weighted_percentile(signed, w_per_pt, cfg.object_top_percentile)
+            height_m = float(max(0.0, top))
+        else:
+            table_z = _ring_table_z_fallback(
+                mask_depth=mask_depth,
+                depth=packet.depth,
+                k_depth=k_depth,
+                t_world_camera=t_world_camera if in_world else None,
+                ring_px=cfg.table_ring_px,
+                min_ring_pixels=cfg.min_table_ring_pixels,
+            )
+            z_lo = _weighted_percentile(pts[:, 2], w_per_pt, cfg.object_base_percentile)
+            z_hi = _weighted_percentile(pts[:, 2], w_per_pt, cfg.object_top_percentile)
+            if table_z is not None:
+                d_lo = abs(table_z - z_lo)
+                d_hi = abs(z_hi - table_z)
+                height_m = float(max(0.0, max(d_lo, d_hi)))
+            else:
+                height_m = float(max(0.0, z_hi - z_lo))
+
+        is_symmetric = det.yaw_hint_rad is None
+        yaw_hint = None if is_symmetric else _yaw_from_points_xy(pts[:, :2], w_per_pt)
+
+        depth_support = int(pts_cam.shape[0])
+        depth_mask_area = max(1, int(np.count_nonzero(mask_depth)))
+        support_ratio = float(np.clip(depth_support / float(depth_mask_area), 0.0, 1.0))
+        # Confidence-weighted quality: support_ratio scaled by mean per-point confidence (normalized).
+        if has_confidence:
+            mean_conf = float(np.mean(w_per_pt))
+            conf_score = float(np.clip((mean_conf - 1.0) / 2.0, 0.0, 1.0))
+            quality = float(np.clip(0.5 * support_ratio + 0.5 * conf_score, 0.0, 1.0))
+        else:
+            quality = support_ratio
+
         out.append(
             ObjectPoseOutput(
                 object_id=f"{det.label}_{idx}",
@@ -111,7 +266,7 @@ def localize_objects_rgbd(
                 quality=quality,
                 covariance_diag=(0.01, 0.01, 0.02),
                 height_m=height_m,
-                source_mode="world" if t_world_camera is not None else "camera",
+                source_mode="world" if in_world else "camera",
             )
         )
     return out

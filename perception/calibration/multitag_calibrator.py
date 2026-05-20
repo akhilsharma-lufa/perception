@@ -64,6 +64,11 @@ class MultiTagCalibrator:
         self._last_world_camera_ts: float = 0.0
         self._smoothed_world_camera: Optional[np.ndarray] = None
 
+    def reset_runtime_state(self) -> None:
+        self._last_world_camera = None
+        self._last_world_camera_ts = 0.0
+        self._smoothed_world_camera = None
+
     def _smooth_world_camera(self, t_world_camera: np.ndarray) -> np.ndarray:
         alpha = float(np.clip(self.settings.pose_smoothing_alpha, 0.0, 1.0))
         if self._smoothed_world_camera is None or alpha <= 0.0:
