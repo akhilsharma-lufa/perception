@@ -33,7 +33,7 @@ def _fmt_coords(coords) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MyCobot 280 connectivity smoke test")
-    parser.add_argument("--port", default="/dev/ttyUSB1")
+    parser.add_argument("--port", default="/dev/ttyUSB0")
     parser.add_argument("--baudrate", type=int, default=1_000_000)
     parser.add_argument("--speed", type=int, default=30)
     parser.add_argument("--skip-home", action="store_true", help="Skip the home move")

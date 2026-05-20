@@ -48,7 +48,7 @@ def _import_mycobot_class():
 
 @dataclass
 class MyCobotDriverSettings:
-    port: str = "/dev/ttyUSB1"
+    port: str = "/dev/ttyUSB0"
     baudrate: int = 1_000_000
     default_speed: int = 30
     coord_mode: int = 1  # 0=angular interpolation, 1=linear interpolation
