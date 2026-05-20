@@ -297,6 +297,20 @@ def main():
             "(noisier). Re-run auto_calibrate_tags to populate it."
         )
 
+    # Pre-warm YOLO so the first frame in the live loop is not a 30-60s freeze on Jetson.
+    # The first inference triggers PyTorch CUDA init + kernel JIT compilation; we do that
+    # here on a dummy frame so the GUI starts responsive.
+    import time as _time
+    print("[perception] loading + warming YOLO (first run on Jetson can take 30-60s)...")
+    _t_warm = _time.monotonic()
+    detector._ensure_model()  # forces model load
+    try:
+        _dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        detector.infer(_dummy, frame_id=0)
+    except Exception as _e:
+        print(f"[perception] warmup inference failed (will retry live): {_e}")
+    print(f"[perception] YOLO ready in {_time.monotonic() - _t_warm:.1f}s")
+
     _last_rot_code = RotationCode.NONE
     source.connect(device_index=args.device_index)
     try:

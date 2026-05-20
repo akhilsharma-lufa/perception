@@ -30,6 +30,7 @@ class CalibrationProfile:
     world_tag_transforms: Dict[str, List[List[float]]] = field(default_factory=dict)
     metrics: Dict[str, float] = field(default_factory=dict)
     table_plane: Optional[TablePlane] = None
+    robot_world_transform: Optional[List[List[float]]] = None
 
     @classmethod
     def new(
@@ -56,6 +57,16 @@ class CalibrationProfile:
         if key not in self.world_tag_transforms:
             return None
         return np.asarray(self.world_tag_transforms[key], dtype=np.float64)
+
+    def set_robot_world_transform(self, t_robot_world: np.ndarray) -> None:
+        self.robot_world_transform = np.asarray(
+            t_robot_world, dtype=np.float64
+        ).reshape(4, 4).tolist()
+
+    def get_robot_world_transform(self) -> Optional[np.ndarray]:
+        if self.robot_world_transform is None:
+            return None
+        return np.asarray(self.robot_world_transform, dtype=np.float64).reshape(4, 4)
 
     def set_table_plane(
         self,
