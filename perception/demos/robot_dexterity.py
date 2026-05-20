@@ -155,7 +155,7 @@ def _run_coord_tour(
             continue
         driver.send_coords_mm_deg(wp.coords_mm_deg, speed=speed)
         try:
-            driver.wait_until_done(strict=False, timeout_s=20.0)
+            driver.wait_until_done(strict=False, timeout_s=60.0)
         except Exception as e:
             print(f"    wait_until_done: {e} — continuing")
         _maybe_apply_gripper(gripper, wp.gripper_value)

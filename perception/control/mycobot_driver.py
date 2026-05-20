@@ -56,7 +56,7 @@ class MyCobotDriverSettings:
         default_factory=lambda: (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     )
     wait_poll_interval_s: float = 0.08
-    default_wait_timeout_s: float = 25.0
+    default_wait_timeout_s: float = 60.0
     position_tolerance_mm: float = 5.0
     # If pymycobot.is_moving() returns ambiguous values (None/-1) for this many
     # consecutive polls AND the position has been stable, assume motion is done.
