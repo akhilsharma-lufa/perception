@@ -39,6 +39,13 @@ def main() -> None:
     parser.add_argument("--skip-home", action="store_true", help="Skip the home move")
     parser.add_argument("--skip-gripper", action="store_true", help="Skip the gripper cycle")
     parser.add_argument(
+        "--home-j6",
+        type=float,
+        default=-45.0,
+        help="Joint 6 (gripper yaw) angle at home, in degrees. Default -45 cancels "
+             "the +45 deg yaw seen at zero-angle home. Pass 0 for raw home.",
+    )
+    parser.add_argument(
         "--gripper-close-value",
         type=int,
         default=40,
@@ -52,6 +59,7 @@ def main() -> None:
             port=args.port,
             baudrate=args.baudrate,
             default_speed=args.speed,
+            home_angles_deg=(0.0, 0.0, 0.0, 0.0, 0.0, float(args.home_j6)),
         )
     )
     driver.connect()

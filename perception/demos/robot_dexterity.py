@@ -74,6 +74,28 @@ _JOINT_TOUR: list[JointWaypoint] = [
 ]
 
 
+def _apply_home_yaw_offset(tour: list[JointWaypoint], home_j6: float) -> list[JointWaypoint]:
+    """Bias every waypoint's joint 6 by `home_j6` (degrees).
+
+    This is the simplest "rotate the gripper's home yaw" knob: shifting J6
+    on every pose by the same constant moves the gripper-yaw reference
+    without changing the path the wrist traces in 3D.
+    """
+    if abs(home_j6) < 1e-6:
+        return tour
+    out: list[JointWaypoint] = []
+    for wp in tour:
+        new_angles = list(wp.angles_deg)
+        new_angles[5] = float(new_angles[5]) + float(home_j6)
+        out.append(JointWaypoint(
+            label=wp.label,
+            angles_deg=new_angles,
+            gripper_value=wp.gripper_value,
+            dwell_s=wp.dwell_s,
+        ))
+    return out
+
+
 def _build_coord_tour(start_xyz_rpy: list[float]) -> list[CoordWaypoint]:
     """Build a small cartesian tour relative to a known starting pose.
 
@@ -116,9 +138,11 @@ def _run_joint_tour(
     gripper: Optional[Gripper],
     speed: int,
     dry_run: bool,
+    home_j6_offset: float = 0.0,
 ) -> None:
-    print("\n=== joint-space tour ===")
-    for i, wp in enumerate(_JOINT_TOUR):
+    tour = _apply_home_yaw_offset(_JOINT_TOUR, home_j6_offset)
+    print(f"\n=== joint-space tour (home J6 offset = {home_j6_offset:+.1f}°) ===")
+    for i, wp in enumerate(tour):
         prefix = f"[{i+1:02d}/{len(_JOINT_TOUR):02d}] {wp.label:<24}"
         print(f"  {prefix} angles={_fmt_angles(wp.angles_deg)} "
               f"gripper={'-' if wp.gripper_value is None else wp.gripper_value}")
@@ -131,6 +155,8 @@ def _run_joint_tour(
             print(f"    wait_until_done: {e} — continuing")
         _maybe_apply_gripper(gripper, wp.gripper_value)
         time.sleep(float(wp.dwell_s))
+    # Loop end: report the actual final pose
+    return tour[-1] if tour else None  # type: ignore[return-value]
 
 
 def _run_coord_tour(
@@ -172,6 +198,14 @@ def main() -> None:
     parser.add_argument("--skip-coords", action="store_true")
     parser.add_argument("--skip-gripper", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="print only, don't move")
+    parser.add_argument(
+        "--home-j6",
+        type=float,
+        default=-45.0,
+        help="Offset added to every waypoint's joint 6 (gripper yaw), in degrees. "
+             "Default -45 cancels the +45 deg yaw seen at home on this arm. "
+             "Pass 0 for the raw (uncompensated) home.",
+    )
     args = parser.parse_args()
 
     speed = max(1, min(100, int(args.speed)))
@@ -198,7 +232,10 @@ def main() -> None:
             if int(args.repeat) > 1:
                 print(f"\n========== cycle {cycle+1}/{args.repeat} ==========")
             if not args.skip_joints:
-                _run_joint_tour(driver, gripper, speed, args.dry_run)
+                _run_joint_tour(
+                    driver, gripper, speed, args.dry_run,
+                    home_j6_offset=float(args.home_j6),
+                )
             if not args.skip_coords and not args.dry_run:
                 _run_coord_tour(driver, gripper, speed, args.dry_run)
             elif not args.skip_coords and args.dry_run:
@@ -210,8 +247,9 @@ def main() -> None:
         print("\n[dexterity] interrupted — attempting safe home + release")
         if not args.dry_run:
             try:
-                driver.send_angles_deg([0, 0, 0, 0, 0, 0], speed=speed)
-                driver.wait_until_done(timeout_s=8.0)
+                home_angles = [0, 0, 0, 0, 0, float(args.home_j6)]
+                driver.send_angles_deg(home_angles, speed=speed)
+                driver.wait_until_done(strict=False, timeout_s=10.0)
             except Exception as e:
                 print(f"  home attempt failed: {e}")
         sys.exit(130)
