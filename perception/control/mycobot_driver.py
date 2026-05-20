@@ -9,6 +9,43 @@ class RobotMotionError(RuntimeError):
     """Raised when a motion command fails or times out."""
 
 
+def _import_mycobot_class():
+    """Import a MyCobot 280 driver class from pymycobot, tolerating layout
+    differences across pymycobot versions.
+
+    Different releases expose the 280 class in different places:
+        - pymycobot.mycobot280.MyCobot280  (newer)
+        - pymycobot.MyCobot280             (some versions)
+        - pymycobot.MyCobot                (generic, works for 280)
+    """
+    attempts = [
+        ("pymycobot.mycobot280", "MyCobot280"),
+        ("pymycobot", "MyCobot280"),
+        ("pymycobot", "MyCobot"),
+    ]
+    import importlib
+
+    errors: list[str] = []
+    for module_name, class_name in attempts:
+        try:
+            mod = importlib.import_module(module_name)
+        except ImportError as exc:
+            errors.append(f"  - import {module_name}: {exc}")
+            continue
+        cls = getattr(mod, class_name, None)
+        if cls is not None:
+            return cls
+        errors.append(f"  - {module_name}.{class_name}: attribute missing")
+    raise RuntimeError(
+        "Could not locate a MyCobot driver class in pymycobot. Attempts:\n"
+        + "\n".join(errors)
+        + "\n"
+        "If pymycobot is installed, your version may expose a different class. "
+        "Run: python3 -c \"import pymycobot, pkgutil; print(pymycobot.__version__); "
+        "print([m.name for m in pkgutil.iter_modules(pymycobot.__path__)])\""
+    )
+
+
 @dataclass
 class MyCobotDriverSettings:
     port: str = "/dev/ttyUSB1"
@@ -47,13 +84,8 @@ class MyCobotDriver:
     def connect(self) -> None:
         if self._mc is not None:
             return
-        try:
-            from pymycobot.mycobot280 import MyCobot280
-        except ImportError as exc:
-            raise RuntimeError(
-                "pymycobot is not installed. On the Jetson run: pip install pymycobot"
-            ) from exc
-        self._mc = MyCobot280(self.settings.port, self.settings.baudrate)
+        cls = _import_mycobot_class()
+        self._mc = cls(self.settings.port, self.settings.baudrate)
         # The mycobot needs a moment after opening the serial port before it accepts commands.
         time.sleep(0.2)
 
