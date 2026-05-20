@@ -55,9 +55,13 @@ class MyCobotDriverSettings:
     home_angles_deg: Sequence[float] = field(
         default_factory=lambda: (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     )
-    wait_poll_interval_s: float = 0.05
-    default_wait_timeout_s: float = 12.0
+    wait_poll_interval_s: float = 0.08
+    default_wait_timeout_s: float = 25.0
     position_tolerance_mm: float = 5.0
+    # If pymycobot.is_moving() returns ambiguous values (None/-1) for this many
+    # consecutive polls AND the position has been stable, assume motion is done.
+    motion_stable_polls: int = 4
+    motion_stable_tolerance_mm: float = 1.5
 
 
 class MyCobotDriver:
@@ -164,8 +168,20 @@ class MyCobotDriver:
 
     # ---- Motion completion helpers ------------------------------------
 
-    def wait_until_done(self, timeout_s: Optional[float] = None) -> None:
-        """Block until pymycobot reports the arm is no longer moving."""
+    def wait_until_done(
+        self,
+        timeout_s: Optional[float] = None,
+        strict: bool = True,
+    ) -> None:
+        """Block until the arm reports motion complete.
+
+        Primary signal: pymycobot.is_moving() returning 0. That endpoint is
+        unreliable on some firmware (returns None / -1 / stuck at 1), so we
+        also accept "the reported pose has not changed for several polls" as
+        evidence the arm has settled. If neither signal fires within the
+        timeout, raise RobotMotionError (strict=True) or return quietly
+        (strict=False) so callers can decide.
+        """
         mc = self._require_connected()
         timeout = float(
             timeout_s if timeout_s is not None else self.settings.default_wait_timeout_s
@@ -173,15 +189,46 @@ class MyCobotDriver:
         deadline = time.monotonic() + max(0.1, timeout)
         # Give the arm a moment to actually start moving before we poll.
         time.sleep(0.15)
+
+        prev_coords: Optional[list[float]] = None
+        stable_polls = 0
+        tol = float(self.settings.motion_stable_tolerance_mm)
+        need_stable = int(self.settings.motion_stable_polls)
+
         while time.monotonic() < deadline:
+            moving: Optional[int]
             try:
                 moving = mc.is_moving()
             except Exception:
                 moving = None
+
             if moving == 0:
                 return
+
+            # Fallback: if is_moving is unreliable, fall back to detecting that
+            # the pose has stopped changing.
+            if moving not in (0, 1):
+                try:
+                    coords = mc.get_coords()
+                except Exception:
+                    coords = None
+                if coords and prev_coords is not None and len(coords) >= 3:
+                    dx = coords[0] - prev_coords[0]
+                    dy = coords[1] - prev_coords[1]
+                    dz = coords[2] - prev_coords[2]
+                    if (dx * dx + dy * dy + dz * dz) ** 0.5 <= tol:
+                        stable_polls += 1
+                        if stable_polls >= need_stable:
+                            return
+                    else:
+                        stable_polls = 0
+                if coords:
+                    prev_coords = list(coords)
+
             time.sleep(self.settings.wait_poll_interval_s)
-        raise RobotMotionError(f"Motion did not finish within {timeout:.1f}s")
+
+        if strict:
+            raise RobotMotionError(f"Motion did not finish within {timeout:.1f}s")
 
     def is_in_position_mm_deg(
         self,

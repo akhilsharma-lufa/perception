@@ -125,7 +125,10 @@ def _run_joint_tour(
         if dry_run:
             continue
         driver.send_angles_deg(wp.angles_deg, speed=speed)
-        driver.wait_until_done()
+        try:
+            driver.wait_until_done(strict=False)
+        except Exception as e:
+            print(f"    wait_until_done: {e} — continuing")
         _maybe_apply_gripper(gripper, wp.gripper_value)
         time.sleep(float(wp.dwell_s))
 
@@ -152,9 +155,9 @@ def _run_coord_tour(
             continue
         driver.send_coords_mm_deg(wp.coords_mm_deg, speed=speed)
         try:
-            driver.wait_until_done()
+            driver.wait_until_done(strict=False, timeout_s=20.0)
         except Exception as e:
-            print(f"    wait_until_done timed out: {e} — continuing")
+            print(f"    wait_until_done: {e} — continuing")
         _maybe_apply_gripper(gripper, wp.gripper_value)
         time.sleep(float(wp.dwell_s))
 
