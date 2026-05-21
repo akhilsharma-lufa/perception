@@ -84,6 +84,14 @@ def main() -> None:
         help="Conservative reach gate (default 270 mm).",
     )
     parser.add_argument(
+        "--coord-mode",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="pymycobot send_coords mode: 0=angular interp (default, robust), "
+             "1=linear cartesian interp (fails silently if path isn't reachable).",
+    )
+    parser.add_argument(
         "--no-home-after",
         action="store_true",
         help="Skip the return-to-home at the end (default homes the arm).",
@@ -112,6 +120,7 @@ def main() -> None:
             if args.rpy is not None
             else MotionSettings().vertical_rpy_deg
         ),
+        coord_mode=int(args.coord_mode),
     )
     ctx = MotionContext(
         t_robot_world=t_robot_world,

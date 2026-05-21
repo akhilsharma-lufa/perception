@@ -44,8 +44,11 @@ class MotionSettings:
     grasp_offset_from_table_m: float = 0.025
     grasp_close_value: int = 40
     release_clearance_m: float = 0.05
-    # Cartesian send_coords mode: 0 = angular interp, 1 = linear interp.
-    coord_mode: int = 1
+    # Cartesian send_coords mode: 0 = angular/joint interp (robust — only the
+    # endpoint must be reachable, path is whatever the joints can do), 1 =
+    # linear cartesian interp (fails silently if any intermediate point on
+    # the straight line is unreachable). Default 0 for v1 reliability.
+    coord_mode: int = 0
 
 
 @dataclass
