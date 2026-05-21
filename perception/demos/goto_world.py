@@ -173,8 +173,25 @@ def main() -> None:
     driver = MyCobotDriver(MyCobotDriverSettings(port=args.port, baudrate=args.baudrate))
     driver.connect()
     try:
-        if not driver.is_power_on():
-            driver.power_on()
+        # Always call power_on() — is_power_on() can return stale "true" after
+        # a previous run's release_all_servos + disconnect, leaving subsequent
+        # send_* calls as no-ops on an unpowered arm.
+        try:
+            pre_power_state = driver.is_power_on()
+        except Exception as exc:
+            pre_power_state = None
+            print(f"[goto_world] could not read is_power_on() pre-power_on: {exc}")
+        print(f"[goto_world] is_power_on() before power_on() = {pre_power_state}")
+        driver.power_on()
+        import time as _t
+        _t.sleep(0.5)
+        try:
+            post_power_state = driver.is_power_on()
+        except Exception as exc:
+            post_power_state = None
+            print(f"[goto_world] could not read is_power_on() post-power_on: {exc}")
+        print(f"[goto_world] is_power_on() after  power_on() = {post_power_state}")
+
         gripper = Gripper(driver, GripperSettings())
         gripper.open(wait=False)
 
@@ -182,11 +199,26 @@ def main() -> None:
             prepose = [float(v) for v in args.prepose_angles]
             print(f"[goto_world] pre-posing arm to angles {prepose} deg")
             try:
+                angles_before_prepose = driver.get_angles_deg(retries=4)
+                print(f"[goto_world] angles BEFORE prepose: "
+                      f"{[round(a, 1) for a in angles_before_prepose]}")
+            except Exception as exc:
+                print(f"[goto_world] could not read angles before prepose: {exc}")
+            try:
                 driver.send_angles_deg(prepose, speed=int(args.speed))
-                driver.wait_until_done(strict=False)
+                # Explicit sleep, not wait_until_done — we want to give the arm
+                # real wall-clock time to physically move, in case is_moving()
+                # lies about the motion having finished.
+                _t.sleep(3.5)
             except Exception as exc:
                 print(f"[goto_world] WARN: pre-pose send_angles failed: {exc} "
                       f"(continuing with send_coords anyway)")
+            try:
+                angles_after_prepose = driver.get_angles_deg(retries=4)
+                print(f"[goto_world] angles AFTER  prepose: "
+                      f"{[round(a, 1) for a in angles_after_prepose]}")
+            except Exception as exc:
+                print(f"[goto_world] could not read angles after prepose: {exc}")
 
         # Snapshot pose BEFORE the move so we can tell if the arm actually went anywhere.
         try:
