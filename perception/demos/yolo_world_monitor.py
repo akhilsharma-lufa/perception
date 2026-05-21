@@ -317,6 +317,7 @@ def main():
         k: [] for k in ("fetch", "apriltag", "anchor", "drift", "yolo",
                         "localize", "tracker", "render", "loop")
     }
+    _frame_age_ms: list[float] = []
     _stage_log_every = 30
     _loop_t_prev = _time.perf_counter()
     try:
@@ -327,6 +328,7 @@ def main():
             _stage_ms["fetch"].append((_time.perf_counter() - _t) * 1000.0)
             if packet is None:
                 continue
+            _frame_age_ms.append((_time.monotonic() - packet.ts_monotonic) * 1000.0)
 
             _t = _time.perf_counter()
             obs = calibrator.detect_tags(packet.rgb, packet.intrinsic_mat, packet.ts_monotonic)
@@ -447,7 +449,16 @@ def main():
                     arr = np.asarray(vals, dtype=np.float64)
                     parts.append(f"{k}={arr.mean():.0f}/{np.percentile(arr, 95):.0f}")
                     _stage_ms[k].clear()
-                print(f"[loop] fps={fps:.1f}  " + "  ".join(parts) + "   (mean/p95 ms)")
+                if _frame_age_ms:
+                    age_arr = np.asarray(_frame_age_ms, dtype=np.float64)
+                    age_str = (
+                        f"  frame_age={age_arr.mean():.0f}/{np.percentile(age_arr, 95):.0f}/"
+                        f"{age_arr.max():.0f} (mean/p95/max ms)"
+                    )
+                    _frame_age_ms.clear()
+                else:
+                    age_str = ""
+                print(f"[loop] fps={fps:.1f}  " + "  ".join(parts) + "   (stage mean/p95 ms)" + age_str)
 
             if key in (ord("q"), 27):
                 break
