@@ -108,6 +108,28 @@ def main() -> None:
         help="Skip the joint-space pre-pose before send_coords.",
     )
     parser.add_argument(
+        "--prepose-speed",
+        type=int,
+        default=40,
+        help="Speed (1..100) for the joint-space pre-pose move. Higher than the "
+             "cartesian --speed because the prepose is a known-safe move and "
+             "we want it to finish quickly.",
+    )
+    parser.add_argument(
+        "--prepose-timeout-s",
+        type=float,
+        default=10.0,
+        help="Max wall-clock seconds to wait for the pre-pose to complete.",
+    )
+    parser.add_argument(
+        "--release-servos",
+        action="store_true",
+        help="At the end of the run, release all servos (arm goes limp and "
+             "the gripper drops). Default is to keep servos engaged so the "
+             "arm holds position, which gives the next run a clean starting "
+             "pose. Pass this flag if you want to hand-move the arm.",
+    )
+    parser.add_argument(
         "--no-home-after",
         action="store_true",
         help="Skip the return-to-home at the end (default homes the arm).",
@@ -197,26 +219,45 @@ def main() -> None:
 
         if not args.no_prepose:
             prepose = [float(v) for v in args.prepose_angles]
-            print(f"[goto_world] pre-posing arm to angles {prepose} deg")
+            prepose_speed = max(1, min(100, int(args.prepose_speed)))
+            print(f"[goto_world] pre-posing arm to angles {prepose} deg "
+                  f"(speed={prepose_speed}, timeout={args.prepose_timeout_s}s)")
             try:
                 angles_before_prepose = driver.get_angles_deg(retries=4)
                 print(f"[goto_world] angles BEFORE prepose: "
                       f"{[round(a, 1) for a in angles_before_prepose]}")
             except Exception as exc:
+                angles_before_prepose = None
                 print(f"[goto_world] could not read angles before prepose: {exc}")
             try:
-                driver.send_angles_deg(prepose, speed=int(args.speed))
-                # Explicit sleep, not wait_until_done — we want to give the arm
-                # real wall-clock time to physically move, in case is_moving()
-                # lies about the motion having finished.
-                _t.sleep(3.5)
+                driver.send_angles_deg(prepose, speed=prepose_speed)
             except Exception as exc:
                 print(f"[goto_world] WARN: pre-pose send_angles failed: {exc} "
                       f"(continuing with send_coords anyway)")
+
+            # Poll until joint angles converge to target, with hard timeout.
+            tol_deg = 3.0
+            deadline = _t.monotonic() + float(args.prepose_timeout_s)
+            while _t.monotonic() < deadline:
+                try:
+                    cur = driver.get_angles_deg(retries=2)
+                except Exception:
+                    _t.sleep(0.1)
+                    continue
+                max_err = max(abs(cur[i] - prepose[i]) for i in range(6))
+                if max_err <= tol_deg:
+                    break
+                _t.sleep(0.15)
+
             try:
                 angles_after_prepose = driver.get_angles_deg(retries=4)
                 print(f"[goto_world] angles AFTER  prepose: "
                       f"{[round(a, 1) for a in angles_after_prepose]}")
+                max_err = max(abs(angles_after_prepose[i] - prepose[i]) for i in range(6))
+                if max_err > tol_deg:
+                    print(f"[goto_world] WARN: prepose not fully converged "
+                          f"(max joint error {max_err:.1f}° > {tol_deg:.1f}°). "
+                          f"Increase --prepose-timeout-s or --prepose-speed.")
             except Exception as exc:
                 print(f"[goto_world] could not read angles after prepose: {exc}")
 
@@ -267,10 +308,16 @@ def main() -> None:
         if not args.no_home_after:
             driver.home(speed=int(args.speed))
     finally:
-        try:
-            driver.release_all_servos()
-        except Exception:
-            pass
+        if args.release_servos:
+            print("[goto_world] releasing all servos (arm will drop).")
+            try:
+                driver.release_all_servos()
+            except Exception:
+                pass
+        else:
+            print("[goto_world] keeping servos engaged. Next run will start "
+                  "from the current pose. To release: pass --release-servos "
+                  "or restart the arm.")
         driver.disconnect()
 
 
