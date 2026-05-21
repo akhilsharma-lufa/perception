@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -47,6 +48,9 @@ class YoloObjectDetector:
         self._model = None
         self._last: list[YoloDetection] = []
         self._last_fresh_frame_id: int = -1000
+        self._infer_times_ms: list[float] = []
+        self._infer_count: int = 0
+        self._logged_input_shape: bool = False
 
     @staticmethod
     def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -133,6 +137,15 @@ class YoloObjectDetector:
                 "ultralytics is not installed. Install it with: pip install ultralytics"
             ) from exc
         self._model = YOLO(self.settings.model_path)
+        try:
+            dev = getattr(self._model, "device", None)
+            dtype = next(self._model.model.parameters()).dtype
+            print(
+                f"[yolo] loaded model={self.settings.model_path} device={dev} "
+                f"dtype={dtype}"
+            )
+        except Exception as exc:
+            print(f"[yolo] could not introspect model device/dtype: {exc}")
 
     def _label_allowed(self, label: str) -> bool:
         if not self.settings.class_whitelist:
@@ -180,7 +193,26 @@ class YoloObjectDetector:
         orig_h, orig_w = rgb.shape[:2]
         infer_rgb = rotate_to_upright(rgb, rot_code)
 
+        if not self._logged_input_shape:
+            print(
+                f"[yolo] first inference input shape (HxWxC) = "
+                f"{infer_rgb.shape[0]}x{infer_rgb.shape[1]}x{infer_rgb.shape[2]}"
+            )
+            self._logged_input_shape = True
+
+        _t0 = time.perf_counter()
         results = self._model(infer_rgb, verbose=False)
+        _dt_ms = (time.perf_counter() - _t0) * 1000.0
+        self._infer_times_ms.append(_dt_ms)
+        self._infer_count += 1
+        if len(self._infer_times_ms) >= 10:
+            arr = np.asarray(self._infer_times_ms, dtype=np.float64)
+            print(
+                f"[yolo] infer #{self._infer_count - 9}..{self._infer_count}  "
+                f"mean={arr.mean():.0f}ms  p95={np.percentile(arr, 95):.0f}ms  "
+                f"last={arr[-1]:.0f}ms"
+            )
+            self._infer_times_ms.clear()
         if not results:
             return []
         res = results[0]
