@@ -29,6 +29,10 @@ class YoloDetectorSettings:
     track_anchor_dist_px: float = 80.0
     anchor_ema_alpha: float = 0.40
     symmetric_classes: frozenset[str] = field(default_factory=lambda: SYMMETRIC_CLASSES)
+    device: str = "auto"   # "auto" -> cuda if available else cpu; or "cuda" / "cpu"
+    half: bool = True       # FP16 inference (cuda only; ignored on cpu)
+    imgsz: int = 480        # inference resolution short-side
+    warmup_iters: int = 3   # dummy forward passes after model load
 
 
 @dataclass
@@ -46,6 +50,8 @@ class YoloObjectDetector:
     def __init__(self, settings: Optional[YoloDetectorSettings] = None):
         self.settings = settings or YoloDetectorSettings()
         self._model = None
+        self._device: str = "cpu"
+        self._use_half: bool = False
         self._last: list[YoloDetection] = []
         self._last_fresh_frame_id: int = -1000
         self._infer_times_ms: list[float] = []
@@ -137,15 +143,55 @@ class YoloObjectDetector:
                 "ultralytics is not installed. Install it with: pip install ultralytics"
             ) from exc
         self._model = YOLO(self.settings.model_path)
+
+        requested = (self.settings.device or "auto").lower()
+        if requested == "auto":
+            try:
+                import torch as _torch
+                self._device = "cuda" if _torch.cuda.is_available() else "cpu"
+            except Exception:
+                self._device = "cpu"
+        else:
+            self._device = requested
+        self._use_half = bool(self.settings.half) and self._device.startswith("cuda")
+
         try:
-            dev = getattr(self._model, "device", None)
+            self._model.to(self._device)
+        except Exception as exc:
+            print(f"[yolo] could not move model to {self._device}: {exc}")
+
+        try:
+            dev_attr = getattr(self._model, "device", None)
             dtype = next(self._model.model.parameters()).dtype
             print(
-                f"[yolo] loaded model={self.settings.model_path} device={dev} "
-                f"dtype={dtype}"
+                f"[yolo] loaded model={self.settings.model_path} "
+                f"device={self._device} (model.device={dev_attr}) "
+                f"dtype={dtype} half={self._use_half} imgsz={self.settings.imgsz}"
             )
         except Exception as exc:
             print(f"[yolo] could not introspect model device/dtype: {exc}")
+
+        warmup_iters = int(max(0, self.settings.warmup_iters))
+        if warmup_iters > 0:
+            try:
+                size = int(self.settings.imgsz)
+                dummy = np.zeros((size, size, 3), dtype=np.uint8)
+                _wt0 = time.perf_counter()
+                for _ in range(warmup_iters):
+                    _ = self._model(
+                        dummy,
+                        verbose=False,
+                        device=self._device,
+                        half=self._use_half,
+                        imgsz=int(self.settings.imgsz),
+                    )
+                _wdt_ms = (time.perf_counter() - _wt0) * 1000.0
+                print(
+                    f"[yolo] warmup x{warmup_iters} done in {_wdt_ms:.0f}ms "
+                    f"(avg {_wdt_ms / warmup_iters:.0f}ms/iter)"
+                )
+            except Exception as exc:
+                print(f"[yolo] warmup failed: {exc}")
 
     def _label_allowed(self, label: str) -> bool:
         if not self.settings.class_whitelist:
@@ -201,7 +247,13 @@ class YoloObjectDetector:
             self._logged_input_shape = True
 
         _t0 = time.perf_counter()
-        results = self._model(infer_rgb, verbose=False)
+        results = self._model(
+            infer_rgb,
+            verbose=False,
+            device=self._device,
+            half=self._use_half,
+            imgsz=int(self.settings.imgsz),
+        )
         _dt_ms = (time.perf_counter() - _t0) * 1000.0
         self._infer_times_ms.append(_dt_ms)
         self._infer_count += 1
