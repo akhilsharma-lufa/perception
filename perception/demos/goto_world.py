@@ -92,6 +92,22 @@ def main() -> None:
              "1=linear cartesian interp (fails silently if path isn't reachable).",
     )
     parser.add_argument(
+        "--prepose-angles",
+        type=float,
+        nargs=6,
+        default=[0.0, -30.0, -30.0, 0.0, 0.0, -45.0],
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        help="6-joint angle config (deg) to send_angles BEFORE the cartesian move, "
+             "to bias the IK solver and avoid silent send_coords rejection on "
+             "big jumps from home. Default puts the arm in a 'shoulder forward, "
+             "elbow down' ready pose. Use --no-prepose to skip.",
+    )
+    parser.add_argument(
+        "--no-prepose",
+        action="store_true",
+        help="Skip the joint-space pre-pose before send_coords.",
+    )
+    parser.add_argument(
         "--no-home-after",
         action="store_true",
         help="Skip the return-to-home at the end (default homes the arm).",
@@ -161,6 +177,17 @@ def main() -> None:
             driver.power_on()
         gripper = Gripper(driver, GripperSettings())
         gripper.open(wait=False)
+
+        if not args.no_prepose:
+            prepose = [float(v) for v in args.prepose_angles]
+            print(f"[goto_world] pre-posing arm to angles {prepose} deg")
+            try:
+                driver.send_angles_deg(prepose, speed=int(args.speed))
+                driver.wait_until_done(strict=False)
+            except Exception as exc:
+                print(f"[goto_world] WARN: pre-pose send_angles failed: {exc} "
+                      f"(continuing with send_coords anyway)")
+
         # Snapshot pose BEFORE the move so we can tell if the arm actually went anywhere.
         try:
             pose_before = driver.get_coords_mm_deg(retries=4)
