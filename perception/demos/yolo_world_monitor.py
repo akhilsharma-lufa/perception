@@ -313,17 +313,38 @@ def main():
 
     _last_rot_code = RotationCode.NONE
     source.connect(device_index=args.device_index)
+    _stage_ms: dict[str, list[float]] = {
+        k: [] for k in ("fetch", "apriltag", "anchor", "drift", "yolo",
+                        "localize", "tracker", "render", "loop")
+    }
+    _stage_log_every = 30
+    _loop_t_prev = _time.perf_counter()
     try:
         while True:
+            _loop_t0 = _time.perf_counter()
+            _t = _time.perf_counter()
             packet = source.wait_for_frame(timeout_s=0.25)
+            _stage_ms["fetch"].append((_time.perf_counter() - _t) * 1000.0)
             if packet is None:
                 continue
 
+            _t = _time.perf_counter()
             obs = calibrator.detect_tags(packet.rgb, packet.intrinsic_mat, packet.ts_monotonic)
-            anchor = calibrator.estimate_world_camera(obs, profile)
-            drift_m = manager.evaluate_runtime_geometry_drift(obs, profile)
+            _stage_ms["apriltag"].append((_time.perf_counter() - _t) * 1000.0)
 
+            _t = _time.perf_counter()
+            anchor = calibrator.estimate_world_camera(obs, profile)
+            _stage_ms["anchor"].append((_time.perf_counter() - _t) * 1000.0)
+
+            _t = _time.perf_counter()
+            drift_m = manager.evaluate_runtime_geometry_drift(obs, profile)
+            _stage_ms["drift"].append((_time.perf_counter() - _t) * 1000.0)
+
+            _t = _time.perf_counter()
             detections = detector.infer(packet.rgb, frame_id=packet.frame_id, camera_pose=packet.camera_pose)
+            _stage_ms["yolo"].append((_time.perf_counter() - _t) * 1000.0)
+
+            _t = _time.perf_counter()
             raw_outputs = localize_objects_rgbd(
                 packet=packet,
                 detections=detections,
@@ -331,8 +352,12 @@ def main():
                 settings=localizer_cfg,
                 table_plane=profile.table_plane,
             )
+            _stage_ms["localize"].append((_time.perf_counter() - _t) * 1000.0)
+
+            _t = _time.perf_counter()
             src_indices = [_src_idx_from_object_id(o.object_id) for o in raw_outputs]
             tracked_outputs = tracker.update(raw_outputs)
+            _stage_ms["tracker"].append((_time.perf_counter() - _t) * 1000.0)
             output_by_det_idx = {
                 src_indices[i]: tracked_outputs[i]
                 for i in range(len(tracked_outputs))
@@ -401,10 +426,29 @@ def main():
                 cv2.LINE_AA,
             )
 
+            _t = _time.perf_counter()
             cv2.imshow("perception_yolo_rgb", rgb_display)
             cv2.imshow("perception_yolo_depth", depth_display)
 
             key = cv2.waitKey(1) & 0xFF
+            _stage_ms["render"].append((_time.perf_counter() - _t) * 1000.0)
+            _stage_ms["loop"].append((_time.perf_counter() - _loop_t0) * 1000.0)
+
+            if len(_stage_ms["loop"]) >= _stage_log_every:
+                now = _time.perf_counter()
+                fps = _stage_log_every / max(1e-6, now - _loop_t_prev)
+                _loop_t_prev = now
+                parts = []
+                for k in ("fetch", "apriltag", "anchor", "drift", "yolo",
+                          "localize", "tracker", "render", "loop"):
+                    vals = _stage_ms[k]
+                    if not vals:
+                        continue
+                    arr = np.asarray(vals, dtype=np.float64)
+                    parts.append(f"{k}={arr.mean():.0f}/{np.percentile(arr, 95):.0f}")
+                    _stage_ms[k].clear()
+                print(f"[loop] fps={fps:.1f}  " + "  ".join(parts) + "   (mean/p95 ms)")
+
             if key in (ord("q"), 27):
                 break
     finally:
