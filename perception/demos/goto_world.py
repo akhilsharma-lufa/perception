@@ -152,12 +152,47 @@ def main() -> None:
             driver.power_on()
         gripper = Gripper(driver, GripperSettings())
         gripper.open(wait=False)
+        # Snapshot pose BEFORE the move so we can tell if the arm actually went anywhere.
+        try:
+            pose_before = driver.get_coords_mm_deg(retries=4)
+            print(f"[goto_world] pose BEFORE move (mm/deg): "
+                  f"({pose_before[0]:+.1f}, {pose_before[1]:+.1f}, {pose_before[2]:+.1f}, "
+                  f"{pose_before[3]:+.1f}, {pose_before[4]:+.1f}, {pose_before[5]:+.1f})")
+        except Exception as exc:
+            pose_before = None
+            print(f"[goto_world] could not read pose before move: {exc}")
         try:
             move_to_world(driver, target, ctx, speed=int(args.speed))
         except ReachabilityError as e:
             print(f"[goto_world] reach error: {e}")
             sys.exit(3)
-        print("[goto_world] arrived. Holding pose for 2 s, then "
+        try:
+            pose_after = driver.get_coords_mm_deg(retries=4)
+            print(f"[goto_world] pose AFTER  move (mm/deg): "
+                  f"({pose_after[0]:+.1f}, {pose_after[1]:+.1f}, {pose_after[2]:+.1f}, "
+                  f"{pose_after[3]:+.1f}, {pose_after[4]:+.1f}, {pose_after[5]:+.1f})")
+            if pose_before is not None:
+                dx = pose_after[0] - pose_before[0]
+                dy = pose_after[1] - pose_before[1]
+                dz = pose_after[2] - pose_before[2]
+                delta_mm = float(np.sqrt(dx * dx + dy * dy + dz * dz))
+                print(f"[goto_world] arm tip moved {delta_mm:.1f} mm "
+                      f"(dx={dx:+.1f}, dy={dy:+.1f}, dz={dz:+.1f})")
+                if delta_mm < 5.0:
+                    print(f"[goto_world] WARN: arm barely moved. IK solver may have rejected the target "
+                          f"(XYZ+RPY combination has no valid solution). Try a different --rpy.")
+            tx_mm = p_robot[0] * 1000.0
+            ty_mm = p_robot[1] * 1000.0
+            tz_mm = p_robot[2] * 1000.0
+            err_xyz = float(np.sqrt(
+                (pose_after[0] - tx_mm) ** 2
+                + (pose_after[1] - ty_mm) ** 2
+                + (pose_after[2] - tz_mm) ** 2
+            ))
+            print(f"[goto_world] error vs commanded target: {err_xyz:.1f} mm")
+        except Exception as exc:
+            print(f"[goto_world] could not read pose after move: {exc}")
+        print("[goto_world] holding pose for 2 s, then "
               + ("returning home." if not args.no_home_after else "releasing servos."))
         import time as _t
         _t.sleep(2.0)
