@@ -62,17 +62,22 @@ class MotionSettings:
     # of headroom above the table by setting the constant to 0.125.
     # Previous tool was a 12 mm pointer (0.012 m).
     tip_offset_z_m: float = 0.125
-    # Constant world-frame XY correction (meters) for the gripper centerline.
+    # Constant TOOL0-FRAME XY offset (meters) for the gripper centerline.
     # The pointer used during touch_calibrate was glued slightly off-center on
-    # the flange, so the calibrated T_robot_world maps `world -> pointer-tip`,
-    # but the gripper's actual finger centerline sits offset from where the
-    # pointer was. Compensate by SUBTRACTING this from the world target before
-    # the transform: command(world) = desired(world) - tip_offset_world_xy_m.
-    # Empirically determined for the current setup: with j6 ≈ 0 and RPY=(180,0,0),
-    # commanding world (85, 80, 0) lands the centerline at world (100, 80, 0),
-    # so the offset is +15 mm in world X (the gripper sits 15 mm to the user's
-    # right of where the calibration thinks it is).
-    tip_offset_world_xy_m: tuple[float, float] = (0.015, 0.0)
+    # the flange, so calibration maps `world -> pointer-tip`, but the gripper's
+    # actual finger centerline sits offset from where the pointer was. Applied
+    # in tool0 frame via the active RPY, so it follows the gripper's
+    # orientation:
+    #   flange_robot = T @ world - R_robot_tool0 @ (off_x, off_y, tip_offset_z_m)
+    # Derivation for the current setup (top-down RPY=(180,0,0)):
+    #   user verified that commanding world (85, 80) lands the closed-finger
+    #   centerline at world (100, 80) — i.e., the gripper sits +15 mm in
+    #   world X compared to where the calibration thinks it is. With
+    #   robot X ≈ -world X (from the data) and R for RPY=(180,0,0) being
+    #   diag(1, -1, -1), the gripper offset in tool0 frame works out to
+    #   (-0.015, 0, 0.125) — negative X in tool0. With this set, commanding
+    #   world W lands the centerline at world W exactly.
+    tip_offset_tool0_xy_m: tuple[float, float] = (-0.015, 0.0)
 
 
 @dataclass
@@ -89,6 +94,24 @@ def world_to_robot(p_world_m: Sequence[float], t_robot_world: np.ndarray) -> np.
     p = np.asarray(p_world_m, dtype=np.float64).reshape(3)
     ph = np.array([p[0], p[1], p[2], 1.0], dtype=np.float64)
     return (np.asarray(t_robot_world, dtype=np.float64) @ ph)[:3]
+
+
+def _rpy_to_rotation_matrix(rpy_deg: Sequence[float]) -> np.ndarray:
+    """Convert (Rx, Ry, Rz) Euler angles in degrees to a 3x3 rotation matrix.
+
+    Convention: XYZ extrinsic (i.e., R = Rz @ Ry @ Rx). This is consistent
+    with pymycobot's send_coords RPY interpretation. With RPY=(180, 0, 0),
+    the resulting matrix has tool0 +Z aligned with robot -Z (gripper points
+    down), which matches what we've verified empirically.
+    """
+    rx, ry, rz = np.radians(np.asarray(rpy_deg, dtype=np.float64).reshape(3))
+    cx, sx = float(np.cos(rx)), float(np.sin(rx))
+    cy, sy = float(np.cos(ry)), float(np.sin(ry))
+    cz, sz = float(np.cos(rz)), float(np.sin(rz))
+    rx_mat = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=np.float64)
+    ry_mat = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float64)
+    rz_mat = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float64)
+    return rz_mat @ ry_mat @ rx_mat
 
 
 def project_above_table(
@@ -143,15 +166,7 @@ def move_to_world(
     rpy_deg: Optional[tuple[float, float, float]] = None,
     wait: bool = True,
 ) -> None:
-    # World-XY centerline correction. The calibrated T_robot_world maps to
-    # where the touch-calibration pointer was, which is slightly offset from
-    # the gripper's actual finger centerline. Shift the world target by the
-    # negative offset so the gripper centerline lands at the requested point.
-    offset_xy = np.asarray(ctx.settings.tip_offset_world_xy_m, dtype=np.float64)
     p_world_m = np.asarray(p_world_m, dtype=np.float64).reshape(3).copy()
-    p_world_m[0] -= float(offset_xy[0])
-    p_world_m[1] -= float(offset_xy[1])
-
     reachable, dist = is_reachable(p_world_m, ctx)
     if not reachable:
         raise ReachabilityError(
@@ -161,13 +176,25 @@ def move_to_world(
         )
     # T_robot_world maps world -> tip-in-robot (because touch_calibrate.py
     # records the tip, not the flange). The arm controller takes a FLANGE
-    # pose, so push the flange up by tip_offset_z_m in robot Z to land the
-    # tip at the commanded world point. Assumes the gripper is pointed down.
-    p_robot_tip = world_to_robot(p_world_m, ctx.t_robot_world)
-    p_robot_flange = p_robot_tip + np.array(
-        [0.0, 0.0, float(ctx.settings.tip_offset_z_m)], dtype=np.float64
-    )
+    # pose, so subtract the tool0 +Z direction (in robot frame) times the
+    # tip-offset length to get from tip back to flange. This makes the
+    # offset RPY-aware: for top-down (RPY=180,0,0), tool0 +Z = -robot_Z so
+    # subtracting it bumps the flange UP in robot Z (matches previous code);
+    # for side approach (e.g., RPY=0,-90,0), tool0 +Z is horizontal so the
+    # flange is offset horizontally, not vertically.
     rpy = rpy_deg if rpy_deg is not None else ctx.settings.vertical_rpy_deg
+    p_robot_tip = world_to_robot(p_world_m, ctx.t_robot_world)
+    r_robot_tool0 = _rpy_to_rotation_matrix(rpy)
+    # Full 3D tool0-frame offset from flange to gripper centerline tip:
+    #   (off_x, off_y, off_z) — XY is the centerline lateral correction
+    #   from the touch-calibration pointer's mounting offset; Z is the
+    #   tool length (flange face to fingertip).
+    off_x, off_y = ctx.settings.tip_offset_tool0_xy_m
+    tip_offset_tool0 = np.array(
+        [float(off_x), float(off_y), float(ctx.settings.tip_offset_z_m)],
+        dtype=np.float64,
+    )
+    p_robot_flange = p_robot_tip - r_robot_tool0 @ tip_offset_tool0
     coords = _coords_mm_deg(p_robot_flange, rpy)
     s = int(speed if speed is not None else ctx.settings.default_speed)
     driver.send_coords_mm_deg(coords, speed=s, mode=int(ctx.settings.coord_mode))
