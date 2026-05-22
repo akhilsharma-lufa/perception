@@ -370,27 +370,65 @@ def main() -> None:
         time.sleep(0.5)
         gripper = Gripper(driver, GripperSettings())
 
+        def _log_pose(tag: str) -> None:
+            try:
+                p = driver.get_coords_mm_deg(retries=4)
+                print(f"[pick_place]   pose AFTER {tag} (mm/deg): "
+                      f"({p[0]:+.1f}, {p[1]:+.1f}, {p[2]:+.1f}, "
+                      f"{p[3]:+.1f}, {p[4]:+.1f}, {p[5]:+.1f})")
+            except Exception as exc:
+                print(f"[pick_place]   pose AFTER {tag}: read failed: {exc}")
+
+        def _log_gripper(tag: str) -> None:
+            try:
+                v = gripper.get_value()
+                print(f"[pick_place]   gripper AFTER {tag}: value={v} "
+                      f"(0=open, 100=closed)")
+            except Exception as exc:
+                print(f"[pick_place]   gripper AFTER {tag}: read failed: {exc}")
+
         try:
+            # Force the gripper FULLY open (blocking) before any motion. This
+            # eliminates a race between gripper.open(wait=False) in pre_grasp
+            # and the immediately-following arm motion, which can leave the
+            # fingers half-closed during descent.
+            print("[pick_place] forcing gripper OPEN (blocking)...")
+            gripper.open(wait=True)
+            time.sleep(0.3)
+            _log_gripper("force-open")
+
             print("[pick_place] (1/6) pre_grasp ...")
             pre_grasp(driver, gripper, cup_world, ctx,
                       hover_m=float(args.hover_mm) * 1e-3, speed=int(args.speed))
+            _log_pose("pre_grasp")
+            _log_gripper("pre_grasp")
 
             print("[pick_place] (2/6) descend_and_grasp ...")
             descend_and_grasp(driver, gripper, cup_world, ctx, speed=int(args.speed))
+            _log_pose("descend_and_grasp")
+            _log_gripper("descend_and_grasp")
 
             print("[pick_place] (3/6) lift ...")
             lift(driver, ctx, lift_m=float(args.hover_mm) * 1e-3, speed=int(args.speed))
+            _log_pose("lift")
+            _log_gripper("lift")
 
             print("[pick_place] (4/6) place ...")
             place(driver, gripper, place_world, ctx,
                   release_clearance_m=float(args.release_mm) * 1e-3,
                   speed=int(args.speed))
+            _log_pose("place")
+            _log_gripper("place")
 
             print("[pick_place] (5/6) gentle back-off ...")
             lift(driver, ctx, lift_m=float(args.hover_mm) * 1e-3, speed=int(args.speed))
+            _log_pose("back-off")
+            _log_gripper("back-off")
 
             print("[pick_place] (6/6) home ...")
             home(driver, gripper, speed=int(args.speed))
+            _log_pose("home")
+            _log_gripper("home")
             print("[pick_place] done.")
         except ReachabilityError as exc:
             print(f"[pick_place] reach error mid-sequence: {exc}")
