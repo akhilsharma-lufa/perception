@@ -1,5 +1,5 @@
 numpy
 record3d
-opencv-python
+opencv-contrib-python
 ultralytics
 pupil-apriltags

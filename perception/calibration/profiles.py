@@ -2,7 +2,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -21,23 +21,35 @@ class TablePlane:
 
 
 @dataclass
+class CharucoBoardSpec:
+    """Persisted ChArUco board geometry. Mirrors charuco_board.CharucoBoardConfig
+    but lives here so profiles.py has no opencv import dependency."""
+    squares_x: int = 7
+    squares_y: int = 10
+    square_length_m: float = 0.02
+    marker_length_m: float = 0.015
+    dictionary_name: str = "DICT_4X4_50"
+
+
+@dataclass
 class CalibrationProfile:
     schema_version: str
     created_at_utc: str
-    origin_tag_id: int
-    tag_family: str
-    tag_size_m: float
+    origin_tag_id: int = 0
+    tag_family: str = ""
+    tag_size_m: float = 0.0
     world_tag_transforms: Dict[str, List[List[float]]] = field(default_factory=dict)
     metrics: Dict[str, float] = field(default_factory=dict)
     table_plane: Optional[TablePlane] = None
     robot_world_transform: Optional[List[List[float]]] = None
+    charuco_board: Optional[CharucoBoardSpec] = None
 
     @classmethod
     def new(
         cls,
-        origin_tag_id: int,
-        tag_family: str,
-        tag_size_m: float,
+        origin_tag_id: int = 0,
+        tag_family: str = "",
+        tag_size_m: float = 0.0,
     ) -> "CalibrationProfile":
         return cls(
             schema_version="perception.calibration.v2",
@@ -46,6 +58,15 @@ class CalibrationProfile:
             tag_family=tag_family,
             tag_size_m=float(tag_size_m),
         )
+
+    @classmethod
+    def new_charuco(cls, board: CharucoBoardSpec) -> "CalibrationProfile":
+        p = cls(
+            schema_version="perception.calibration.v3-charuco",
+            created_at_utc=datetime.now(timezone.utc).isoformat(),
+        )
+        p.charuco_board = board
+        return p
 
     def set_world_tag_transform(self, tag_id: int, t_world_tag: np.ndarray):
         self.world_tag_transforms[str(int(tag_id))] = np.asarray(
@@ -82,6 +103,22 @@ class CalibrationProfile:
             mean_abs_residual_m=float(mean_abs_residual_m),
         )
 
+    def set_charuco_board(self, spec: CharucoBoardSpec) -> None:
+        # Accept either a CharucoBoardSpec or anything dict-like / dataclass-like.
+        if isinstance(spec, CharucoBoardSpec):
+            self.charuco_board = spec
+            return
+        if hasattr(spec, "__dict__"):
+            data: Dict[str, Any] = {
+                k: getattr(spec, k) for k in (
+                    "squares_x", "squares_y", "square_length_m",
+                    "marker_length_m", "dictionary_name",
+                )
+            }
+        else:
+            data = dict(spec)
+        self.charuco_board = CharucoBoardSpec(**data)
+
 
 class CalibrationProfileIO:
     @staticmethod
@@ -94,7 +131,17 @@ class CalibrationProfileIO:
     def load(path: str) -> CalibrationProfile:
         data = json.loads(Path(path).read_text())
         table_plane_data = data.pop("table_plane", None)
-        profile = CalibrationProfile(**data)
+        charuco_data = data.pop("charuco_board", None)
+        # Drop unknown keys so old / forward-compatible profiles still load.
+        known = {
+            "schema_version", "created_at_utc", "origin_tag_id", "tag_family",
+            "tag_size_m", "world_tag_transforms", "metrics",
+            "robot_world_transform",
+        }
+        filtered = {k: v for k, v in data.items() if k in known}
+        profile = CalibrationProfile(**filtered)
         if table_plane_data is not None:
             profile.table_plane = TablePlane(**table_plane_data)
+        if charuco_data is not None:
+            profile.charuco_board = CharucoBoardSpec(**charuco_data)
         return profile

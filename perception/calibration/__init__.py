@@ -6,7 +6,12 @@ from .multitag_calibrator import (
     TagDetection,
     TagObservationFrame,
 )
-from .profiles import CalibrationProfile, CalibrationProfileIO, TablePlane
+from .profiles import (
+    CalibrationProfile,
+    CalibrationProfileIO,
+    CharucoBoardSpec,
+    TablePlane,
+)
 from .table_plane_validator import (
     TablePlaneValidationResult,
     validate_table_plane_consistency,
@@ -18,6 +23,7 @@ __all__ = [
     "AutoCalibrationSettings",
     "CalibrationProfile",
     "CalibrationProfileIO",
+    "CharucoBoardSpec",
     "TablePlane",
     "MultiTagCalibrator",
     "MultiTagCalibratorSettings",

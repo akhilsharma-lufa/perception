@@ -3,15 +3,14 @@ import argparse
 import cv2
 import numpy as np
 
-from perception.calibration import (
-    AutoCalibrationManager,
-    AutoCalibrationSettings,
-    CalibrationProfileIO,
-    MultiTagCalibrator,
-    MultiTagCalibratorSettings,
+from perception.calibration import CalibrationProfileIO
+from perception.calibration.charuco_board import (
+    CharucoBoardConfig,
+    detect_board_pose,
 )
 from perception.detection import YoloDetection, YoloDetectorSettings, YoloObjectDetector
 from perception.detection.orientation import RotationCode, detect_orientation, rotate_to_upright
+from perception.geometry.transforms import invert_transform
 from perception.localization import (
     RgbdLocalizerSettings,
     WorldTracker,
@@ -21,7 +20,7 @@ from perception.localization import (
 from perception.io import Record3DSource
 
 
-_DRIFT_WARN_THRESHOLD_M = 0.012  # 12 mm mean tag-to-tag drift starts to matter
+_BOARD_REPROJ_WARN_PX = 1.0
 
 
 def _depth_to_colormap(depth: np.ndarray) -> np.ndarray:
@@ -163,6 +162,65 @@ def _draw_object_overlays(rgb_bgr: np.ndarray, detections, output_by_det_idx):
         )
 
 
+def _draw_board_overlay(
+    rgb_bgr: np.ndarray,
+    detection,
+    intrinsic_3x3: np.ndarray,
+) -> None:
+    """Draw the detected ChArUco corners and a small XYZ axis triad at the board
+    origin so the user can see the anchor live."""
+    if detection is None:
+        return
+    # Corners
+    for (px, py) in detection.corners_image:
+        cv2.circle(
+            rgb_bgr,
+            (int(round(px)), int(round(py))),
+            3,
+            (0, 200, 255),
+            -1,
+            cv2.LINE_AA,
+        )
+    # Axis triad — project (0,0,0), (l,0,0), (0,l,0), (0,0,l) in board frame.
+    axis_len = 0.04
+    pts_board = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [axis_len, 0.0, 0.0],
+            [0.0, axis_len, 0.0],
+            [0.0, 0.0, axis_len],
+        ],
+        dtype=np.float64,
+    )
+    rot = detection.t_camera_board[:3, :3]
+    trans = detection.t_camera_board[:3, 3]
+    pts_cam = (pts_board @ rot.T) + trans
+    # Project into image
+    fx, fy = float(intrinsic_3x3[0, 0]), float(intrinsic_3x3[1, 1])
+    cx, cy = float(intrinsic_3x3[0, 2]), float(intrinsic_3x3[1, 2])
+
+    def _proj(p):
+        if p[2] <= 1e-6:
+            return None
+        return (
+            int(round(fx * p[0] / p[2] + cx)),
+            int(round(fy * p[1] / p[2] + cy)),
+        )
+
+    p_o = _proj(pts_cam[0])
+    p_x = _proj(pts_cam[1])
+    p_y = _proj(pts_cam[2])
+    p_z = _proj(pts_cam[3])
+    if p_o is None:
+        return
+    if p_x is not None:
+        cv2.line(rgb_bgr, p_o, p_x, (0, 0, 255), 2, cv2.LINE_AA)  # X red
+    if p_y is not None:
+        cv2.line(rgb_bgr, p_o, p_y, (0, 255, 0), 2, cv2.LINE_AA)  # Y green
+    if p_z is not None:
+        cv2.line(rgb_bgr, p_o, p_z, (255, 0, 0), 2, cv2.LINE_AA)  # Z blue
+
+
 def _rotate_display(image: np.ndarray, rot_code: RotationCode) -> np.ndarray:
     if rot_code == RotationCode.CW90:
         return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
@@ -219,8 +277,6 @@ def main():
     parser = argparse.ArgumentParser(description="YOLO + RGBD world monitor for cups.")
     parser.add_argument("--profile", default="calibration/profiles/session_multitag.json")
     parser.add_argument("--device-index", type=int, default=0)
-    parser.add_argument("--origin-tag-id", type=int, default=1)
-    parser.add_argument("--tag-size-m", type=float, default=0.04)
     parser.add_argument("--yolo-model", default="yolo26n-seg.pt")
     parser.add_argument("--min-confidence", type=float, default=0.25)
     parser.add_argument(
@@ -234,6 +290,12 @@ def main():
     parser.add_argument("--smooth-alpha", type=float, default=0.30)
     parser.add_argument("--mask-erosion-px", type=int, default=3)
     parser.add_argument("--match-distance-m", type=float, default=0.10)
+    # ChArUco board overrides — defaults read from the profile if available.
+    parser.add_argument("--squares-x", type=int, default=None)
+    parser.add_argument("--squares-y", type=int, default=None)
+    parser.add_argument("--square-mm", type=float, default=None)
+    parser.add_argument("--marker-mm", type=float, default=None)
+    parser.add_argument("--dict", default=None)
     args = parser.parse_args()
 
     class_whitelist = None
@@ -244,16 +306,37 @@ def main():
         ) or None
 
     profile = CalibrationProfileIO.load(args.profile)
-    calibrator = MultiTagCalibrator(
-        MultiTagCalibratorSettings(
-            family=profile.tag_family,
-            tag_size_m=float(args.tag_size_m),
-            origin_tag_id=int(args.origin_tag_id),
+
+    # --- Resolve ChArUco board config (CLI > profile > defaults) -----------
+    board_from_profile = profile.charuco_board
+    board_cfg = CharucoBoardConfig(
+        squares_x=int(
+            args.squares_x if args.squares_x is not None
+            else (board_from_profile.squares_x if board_from_profile else 7)
+        ),
+        squares_y=int(
+            args.squares_y if args.squares_y is not None
+            else (board_from_profile.squares_y if board_from_profile else 10)
+        ),
+        square_length_m=(
+            float(args.square_mm) * 1e-3 if args.square_mm is not None
+            else (board_from_profile.square_length_m if board_from_profile else 0.020)
+        ),
+        marker_length_m=(
+            float(args.marker_mm) * 1e-3 if args.marker_mm is not None
+            else (board_from_profile.marker_length_m if board_from_profile else 0.015)
+        ),
+        dictionary_name=str(
+            args.dict if args.dict is not None
+            else (board_from_profile.dictionary_name if board_from_profile else "DICT_4X4_50")
+        ),
+    )
+    if board_from_profile is None:
+        print(
+            "[perception] WARN: profile has no charuco_board entry. "
+            "Using CLI/defaults — make sure the print matches."
         )
-    )
-    manager = AutoCalibrationManager(
-        calibrator=calibrator, settings=AutoCalibrationSettings(profile_path=args.profile)
-    )
+
     detector = YoloObjectDetector(
         YoloDetectorSettings(
             model_path=args.yolo_model,
@@ -290,20 +373,24 @@ def main():
         f"infer_every_n={int(args.infer_every_n)} hold_frames={int(args.hold_frames)} "
         f"classes={class_whitelist if class_whitelist is not None else '*'}"
     )
+    print(
+        f"[perception] charuco={board_cfg.squares_x}x{board_cfg.squares_y} "
+        f"square={board_cfg.square_length_m * 1000:.1f}mm "
+        f"marker={board_cfg.marker_length_m * 1000:.1f}mm "
+        f"dict={board_cfg.dictionary_name}"
+    )
     print(f"[perception] table_plane={plane_status}")
     if profile.table_plane is None:
         print(
-            "[perception] WARN: no table plane in profile. Heights will use ring-fallback "
-            "(noisier). Re-run auto_calibrate_tags to populate it."
+            "[perception] WARN: no table plane in profile. Heights will use "
+            "ring-fallback (noisier). Re-run auto_calibrate_robot."
         )
 
     # Pre-warm YOLO so the first frame in the live loop is not a 30-60s freeze on Jetson.
-    # The first inference triggers PyTorch CUDA init + kernel JIT compilation; we do that
-    # here on a dummy frame so the GUI starts responsive.
     import time as _time
     print("[perception] loading + warming YOLO (first run on Jetson can take 30-60s)...")
     _t_warm = _time.monotonic()
-    detector._ensure_model()  # forces model load
+    detector._ensure_model()
     try:
         _dummy = np.zeros((480, 640, 3), dtype=np.uint8)
         detector.infer(_dummy, frame_id=0)
@@ -314,12 +401,21 @@ def main():
     _last_rot_code = RotationCode.NONE
     source.connect(device_index=args.device_index)
     _stage_ms: dict[str, list[float]] = {
-        k: [] for k in ("fetch", "apriltag", "anchor", "drift", "yolo",
+        k: [] for k in ("fetch", "charuco", "yolo",
                         "localize", "tracker", "render", "loop")
     }
     _frame_age_ms: list[float] = []
     _stage_log_every = 30
     _loop_t_prev = _time.perf_counter()
+
+    # Anchor state: last good board pose lets us survive a few frames of
+    # detection failure (e.g., the iPhone catches a frame mid-shake).
+    last_t_world_camera: np.ndarray | None = None
+    last_board_detection = None
+    last_reproj_err: float | None = None
+    frames_since_anchor = 0
+    _ANCHOR_STALE_LIMIT = 30  # ~1s at 30 FPS
+
     try:
         while True:
             _loop_t0 = _time.perf_counter()
@@ -331,26 +427,36 @@ def main():
             _frame_age_ms.append((_time.monotonic() - packet.ts_monotonic) * 1000.0)
 
             _t = _time.perf_counter()
-            obs = calibrator.detect_tags(packet.rgb, packet.intrinsic_mat, packet.ts_monotonic)
-            _stage_ms["apriltag"].append((_time.perf_counter() - _t) * 1000.0)
+            board_det = detect_board_pose(
+                packet.rgb, packet.intrinsic_mat, board_cfg
+            )
+            if board_det is not None:
+                t_world_camera = invert_transform(board_det.t_camera_board)
+                last_t_world_camera = t_world_camera
+                last_board_detection = board_det
+                last_reproj_err = float(board_det.reprojection_error_px)
+                frames_since_anchor = 0
+                anchor_mode = "charuco"
+            else:
+                t_world_camera = last_t_world_camera
+                frames_since_anchor += 1
+                if frames_since_anchor > _ANCHOR_STALE_LIMIT:
+                    anchor_mode = "stale"
+                else:
+                    anchor_mode = "held"
+            _stage_ms["charuco"].append((_time.perf_counter() - _t) * 1000.0)
 
             _t = _time.perf_counter()
-            anchor = calibrator.estimate_world_camera(obs, profile)
-            _stage_ms["anchor"].append((_time.perf_counter() - _t) * 1000.0)
-
-            _t = _time.perf_counter()
-            drift_m = manager.evaluate_runtime_geometry_drift(obs, profile)
-            _stage_ms["drift"].append((_time.perf_counter() - _t) * 1000.0)
-
-            _t = _time.perf_counter()
-            detections = detector.infer(packet.rgb, frame_id=packet.frame_id, camera_pose=packet.camera_pose)
+            detections = detector.infer(
+                packet.rgb, frame_id=packet.frame_id, camera_pose=packet.camera_pose
+            )
             _stage_ms["yolo"].append((_time.perf_counter() - _t) * 1000.0)
 
             _t = _time.perf_counter()
             raw_outputs = localize_objects_rgbd(
                 packet=packet,
                 detections=detections,
-                t_world_camera=anchor.t_world_camera,
+                t_world_camera=t_world_camera,
                 settings=localizer_cfg,
                 table_plane=profile.table_plane,
             )
@@ -369,31 +475,28 @@ def main():
             rgb_bgr = cv2.cvtColor(packet.rgb, cv2.COLOR_RGB2BGR)
             depth_bgr = _depth_to_colormap(packet.depth)
             if depth_bgr.shape[:2] != rgb_bgr.shape[:2]:
-                depth_bgr = cv2.resize(depth_bgr, (rgb_bgr.shape[1], rgb_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-            for det in obs.detections:
-                tag_color = (0, 255, 0) if det.tag_id == int(args.origin_tag_id) else (255, 200, 0)
-                tcx, tcy = int(det.center_px[0]), int(det.center_px[1])
-                cv2.drawMarker(rgb_bgr, (tcx, tcy), tag_color, cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
-                cv2.putText(
-                    rgb_bgr,
-                    f"tag:{det.tag_id}",
-                    (tcx + 6, max(18, tcy - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    tag_color,
-                    2,
-                    cv2.LINE_AA,
+                depth_bgr = cv2.resize(
+                    depth_bgr,
+                    (rgb_bgr.shape[1], rgb_bgr.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
                 )
+
+            _draw_board_overlay(rgb_bgr, last_board_detection, packet.intrinsic_mat)
 
             rot_code = detect_orientation(packet.rgb, camera_pose=packet.camera_pose)
             if rot_code != _last_rot_code:
-                rot_names = {RotationCode.NONE: "portrait", RotationCode.CW90: "landscape_cw",
-                             RotationCode.CCW90: "landscape_ccw", RotationCode.ROT180: "rot180"}
-                print(f"[perception] orientation changed: {rot_names.get(rot_code, rot_code)}  "
-                      f"frame={packet.rgb.shape[1]}x{packet.rgb.shape[0]}  "
-                      f"pose=({packet.camera_pose.qx:.3f},{packet.camera_pose.qy:.3f},"
-                      f"{packet.camera_pose.qz:.3f},{packet.camera_pose.qw:.3f})")
+                rot_names = {
+                    RotationCode.NONE: "portrait",
+                    RotationCode.CW90: "landscape_cw",
+                    RotationCode.CCW90: "landscape_ccw",
+                    RotationCode.ROT180: "rot180",
+                }
+                print(
+                    f"[perception] orientation changed: {rot_names.get(rot_code, rot_code)}  "
+                    f"frame={packet.rgb.shape[1]}x{packet.rgb.shape[0]}  "
+                    f"pose=({packet.camera_pose.qx:.3f},{packet.camera_pose.qy:.3f},"
+                    f"{packet.camera_pose.qz:.3f},{packet.camera_pose.qw:.3f})"
+                )
                 _last_rot_code = rot_code
             rgb_display = _rotate_display(rgb_bgr, rot_code)
             depth_display = _rotate_display(depth_bgr, rot_code)
@@ -405,17 +508,22 @@ def main():
             )
 
             _draw_object_overlays(rgb_display, detections_display, output_by_det_idx)
-            drift_status = "-"
-            drift_color = (255, 255, 255)
-            if drift_m > 0.0:
-                drift_status = f"{drift_m * 1000:.1f}mm"
-                if drift_m > _DRIFT_WARN_THRESHOLD_M:
-                    drift_color = (60, 80, 255)  # red-ish in BGR
-                    drift_status += " HIGH"
+
+            reproj_str = (
+                f"{last_reproj_err:.2f}px" if last_reproj_err is not None else "-"
+            )
+            anchor_color = (255, 255, 255)
+            if anchor_mode == "stale":
+                anchor_color = (60, 80, 255)
+            elif (
+                last_reproj_err is not None
+                and last_reproj_err > _BOARD_REPROJ_WARN_PX
+            ):
+                anchor_color = (60, 180, 255)  # orange-ish
+
             status_line = (
-                f"anchor={anchor.anchor_mode} q={anchor.quality:.2f} "
-                f"event={anchor.event if anchor.event else '-'} "
-                f"drift={drift_status} plane={'on' if profile.table_plane else 'off'}"
+                f"anchor={anchor_mode} reproj={reproj_str} "
+                f"held={frames_since_anchor} plane={'on' if profile.table_plane else 'off'}"
             )
             cv2.putText(
                 rgb_display,
@@ -423,7 +531,7 @@ def main():
                 (12, rgb_display.shape[0] - 14),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
-                drift_color,
+                anchor_color,
                 2,
                 cv2.LINE_AA,
             )
@@ -441,7 +549,7 @@ def main():
                 fps = _stage_log_every / max(1e-6, now - _loop_t_prev)
                 _loop_t_prev = now
                 parts = []
-                for k in ("fetch", "apriltag", "anchor", "drift", "yolo",
+                for k in ("fetch", "charuco", "yolo",
                           "localize", "tracker", "render", "loop"):
                     vals = _stage_ms[k]
                     if not vals:
@@ -458,7 +566,10 @@ def main():
                     _frame_age_ms.clear()
                 else:
                     age_str = ""
-                print(f"[loop] fps={fps:.1f}  " + "  ".join(parts) + "   (stage mean/p95 ms)" + age_str)
+                print(
+                    f"[loop] fps={fps:.1f}  " + "  ".join(parts)
+                    + "   (stage mean/p95 ms)" + age_str
+                )
 
             if key in (ord("q"), 27):
                 break
