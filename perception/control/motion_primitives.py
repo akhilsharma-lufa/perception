@@ -49,6 +49,13 @@ class MotionSettings:
     # linear cartesian interp (fails silently if any intermediate point on
     # the straight line is unreachable). Default 0 for v1 reliability.
     coord_mode: int = 0
+    # Distance from flange (tool0) to the tip of the installed tool. With the
+    # canonical "gripper pointing straight down" RPY=(180,0,0), the tip is
+    # `tip_offset_z_m` below the flange in robot Z. The calibration step
+    # (touch_calibrate.py) records tip positions, so `T_robot_world` maps
+    # world -> tip-in-robot; this offset compensates that at runtime so the
+    # actual tip lands at the requested world point.
+    tip_offset_z_m: float = 0.012
 
 
 @dataclass
@@ -126,9 +133,16 @@ def move_to_world(
             f"{dist*1000:.1f} mm from robot base; max reach is "
             f"{ctx.settings.max_reach_m*1000:.1f} mm"
         )
-    p_robot = world_to_robot(p_world_m, ctx.t_robot_world)
+    # T_robot_world maps world -> tip-in-robot (because touch_calibrate.py
+    # records the tip, not the flange). The arm controller takes a FLANGE
+    # pose, so push the flange up by tip_offset_z_m in robot Z to land the
+    # tip at the commanded world point. Assumes the gripper is pointed down.
+    p_robot_tip = world_to_robot(p_world_m, ctx.t_robot_world)
+    p_robot_flange = p_robot_tip + np.array(
+        [0.0, 0.0, float(ctx.settings.tip_offset_z_m)], dtype=np.float64
+    )
     rpy = rpy_deg if rpy_deg is not None else ctx.settings.vertical_rpy_deg
-    coords = _coords_mm_deg(p_robot, rpy)
+    coords = _coords_mm_deg(p_robot_flange, rpy)
     s = int(speed if speed is not None else ctx.settings.default_speed)
     driver.send_coords_mm_deg(coords, speed=s, mode=int(ctx.settings.coord_mode))
     if wait:
