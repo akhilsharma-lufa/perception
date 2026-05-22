@@ -124,6 +124,18 @@ def main():
             "your monitors, before committing to the full ~3-min sweep."
         ),
     )
+    parser.add_argument(
+        "--j1-center-2",
+        type=float,
+        default=None,
+        help=(
+            "Optional SECOND J1 sweep center. If set, the full waypoint table "
+            "is run TWICE: once at --j1-center, then again at --j1-center-2. "
+            "Doubles wall time but covers two hemispheres for a much better "
+            "constrained Kabsch fit. Use only after confirming both sides are "
+            "obstacle-free via separate --max-waypoints 1 probes."
+        ),
+    )
     # Arm reset
     parser.add_argument("--home-speed", type=int, default=40)
     parser.add_argument("--home-timeout-s", type=float, default=12.0)
@@ -282,13 +294,45 @@ def main():
             print(f"[auto-cal] could not read post-home angles: {exc}")
 
         # --- Sweep --------------------------------------------------------
-        print(f"[auto-cal] sweeping {len(auto_cfg.waypoint_offsets_deg)} waypoints...")
+        n_offsets = len(auto_cfg.waypoint_offsets_deg)
+        sweep_centers = [auto_cfg.j1_center_deg]
+        if args.j1_center_2 is not None:
+            sweep_centers.append(float(args.j1_center_2))
+        total_wp = n_offsets * len(sweep_centers)
+        print(
+            f"[auto-cal] sweeping {total_wp} waypoints "
+            f"({n_offsets} offsets x {len(sweep_centers)} hemisphere(s)): "
+            f"j1_centers={sweep_centers}..."
+        )
         t0 = time.monotonic()
-        samples = collect_samples(driver, source, board_cfg, auto_cfg)
+        samples = []
+        for sweep_idx, center in enumerate(sweep_centers):
+            if len(sweep_centers) > 1:
+                print(
+                    f"[auto-cal] === hemisphere {sweep_idx+1}/{len(sweep_centers)}: "
+                    f"j1_center={center:+.1f} ==="
+                )
+                # Re-home BEFORE switching hemispheres so the arm doesn't
+                # swing through the obstacle direction on the way over.
+                if sweep_idx > 0:
+                    print("[auto-cal] re-homing between hemispheres...")
+                    driver.send_angles_deg([0.0] * 6, speed=int(args.home_speed))
+                    t_dead2 = time.monotonic() + float(args.home_timeout_s)
+                    while time.monotonic() < t_dead2:
+                        try:
+                            cur = driver.get_angles_deg(retries=2)
+                        except Exception:
+                            time.sleep(0.2)
+                            continue
+                        if max(abs(a) for a in cur) <= 3.0:
+                            break
+                        time.sleep(0.15)
+            auto_cfg.j1_center_deg = float(center)
+            samples.extend(collect_samples(driver, source, board_cfg, auto_cfg))
         elapsed = time.monotonic() - t0
         print(
             f"[auto-cal] sweep done in {elapsed:.1f}s; "
-            f"{len(samples)}/{len(auto_cfg.waypoint_offsets_deg)} samples valid"
+            f"{len(samples)}/{total_wp} samples valid"
         )
 
         if int(args.max_waypoints) > 0 and int(args.max_waypoints) < auto_cfg.min_inlier_samples:

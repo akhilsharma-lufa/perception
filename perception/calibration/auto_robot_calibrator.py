@@ -59,33 +59,33 @@ from .tip_detector import TipDetectorSettings, detect_tip_in_camera
 # This is a starting set; iterate after first field run if some waypoints
 # place the tip out of camera view.
 WAYPOINT_OFFSETS_DEG: List[List[float]] = [
-    # --- near, low ---
+    # ---------------- HIGH tip (arm reaching out, wrist mildly tilted) ----------------
     [   0, -50, -40,   0, -10,  0],
     [  25, -50, -40,   0, -10,  0],
     [ -25, -50, -40,   0, -10,  0],
-    # --- near, high (more J5 tilt back) ---
     [   0, -55, -30,   0, -25,  0],
     [  25, -55, -30,   0, -25,  0],
     [ -25, -55, -30,   0, -25,  0],
-    # --- medium, low ---
-    [   0, -35, -45,   0, -10,  0],
-    [  30, -35, -45,   0, -10,  0],
-    [ -30, -35, -45,   0, -10,  0],
-    # --- medium, high ---
+    # ---------------- MID-HIGH (medium reach) ----------------------------------------
     [   0, -40, -25,   0, -30,  0],
-    [  25, -40, -25,   0, -30,  0],
-    [ -25, -40, -25,   0, -30,  0],
-    # --- far, low ---
-    [   0, -20, -55,   0, -10,  0],
-    [  20, -20, -55,   0, -10,  0],
-    [ -20, -20, -55,   0, -10,  0],
-    # --- far, high ---
+    [  30, -40, -25,   0, -30,  0],
+    [ -30, -40, -25,   0, -30,  0],
     [   0, -25, -40,   0, -30,  0],
     [  20, -25, -40,   0, -30,  0],
     [ -20, -25, -40,   0, -30,  0],
-    # --- two wide lateral configs to anchor the rotation ---
-    [  45, -40, -30,   0, -20,  0],
-    [ -45, -40, -30,   0, -20,  0],
+    # ---------------- LOW tip (arm folded forward, J5 strongly tilted back so the
+    # pointer still faces UP and remains the global depth-peak above the board) ------
+    [   0, -10, -55,   0, -60,  0],
+    [  25, -10, -55,   0, -60,  0],
+    [ -25, -10, -55,   0, -60,  0],
+    [   0,  +5, -65,   0, -70,  0],
+    [  25,  +5, -65,   0, -70,  0],
+    [ -25,  +5, -65,   0, -70,  0],
+    # ---------------- LOW + lateral extremes (the rotation-anchoring set) -----------
+    [  55, -25, -45,   0, -45,  0],
+    [ -55, -25, -45,   0, -45,  0],
+    [  45,  +0, -55,   0, -60,  0],
+    [ -45,  +0, -55,   0, -60,  0],
 ]
 
 
