@@ -55,7 +55,13 @@ class MotionSettings:
     # (touch_calibrate.py) records tip positions, so `T_robot_world` maps
     # world -> tip-in-robot; this offset compensates that at runtime so the
     # actual tip lands at the requested world point.
-    tip_offset_z_m: float = 0.012
+    # 0.125 m = AG gripper flange-to-closed-fingertip. Backed out from a
+    # hover=200 mm goto_world test: actual flange robot Z = 184.3 mm, observed
+    # fingertip 80 mm above the board (board surface = robot Z ≈ −18.8 mm
+    # given the calibration), so true gripper length ≈ 123 mm; we keep 2 mm
+    # of headroom above the table by setting the constant to 0.125.
+    # Previous tool was a 12 mm pointer (0.012 m).
+    tip_offset_z_m: float = 0.125
 
 
 @dataclass
