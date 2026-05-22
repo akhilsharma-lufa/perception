@@ -451,10 +451,12 @@ def main() -> None:
             print("[pick_place] (6/6) home ...")
             # driver.home()'s wait_until_done can return early on this firmware
             # (is_moving() reports 0 before the motion actually begins). Force
-            # a settle: send home, then sleep long enough for the joints to
-            # complete the swing at the configured speed, then verify pose.
+            # a settle: pause to make sure any residual motion is done, then
+            # send home, then sleep long enough for the joints to complete the
+            # swing at the configured speed, then verify pose.
+            time.sleep(1.5)  # let any residual back-off motion finish first
             home(driver, gripper, speed=int(args.speed))
-            time.sleep(4.0)
+            time.sleep(5.0)
             try:
                 angles = driver.get_angles_deg(retries=4)
                 print(f"[pick_place]   angles AFTER home: "

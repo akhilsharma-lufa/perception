@@ -62,6 +62,17 @@ class MotionSettings:
     # of headroom above the table by setting the constant to 0.125.
     # Previous tool was a 12 mm pointer (0.012 m).
     tip_offset_z_m: float = 0.125
+    # Constant world-frame XY correction (meters) for the gripper centerline.
+    # The pointer used during touch_calibrate was glued slightly off-center on
+    # the flange, so the calibrated T_robot_world maps `world -> pointer-tip`,
+    # but the gripper's actual finger centerline sits offset from where the
+    # pointer was. Compensate by SUBTRACTING this from the world target before
+    # the transform: command(world) = desired(world) - tip_offset_world_xy_m.
+    # Empirically determined for the current setup: with j6 ≈ 0 and RPY=(180,0,0),
+    # commanding world (85, 80, 0) lands the centerline at world (100, 80, 0),
+    # so the offset is +15 mm in world X (the gripper sits 15 mm to the user's
+    # right of where the calibration thinks it is).
+    tip_offset_world_xy_m: tuple[float, float] = (0.015, 0.0)
 
 
 @dataclass
@@ -132,6 +143,15 @@ def move_to_world(
     rpy_deg: Optional[tuple[float, float, float]] = None,
     wait: bool = True,
 ) -> None:
+    # World-XY centerline correction. The calibrated T_robot_world maps to
+    # where the touch-calibration pointer was, which is slightly offset from
+    # the gripper's actual finger centerline. Shift the world target by the
+    # negative offset so the gripper centerline lands at the requested point.
+    offset_xy = np.asarray(ctx.settings.tip_offset_world_xy_m, dtype=np.float64)
+    p_world_m = np.asarray(p_world_m, dtype=np.float64).reshape(3).copy()
+    p_world_m[0] -= float(offset_xy[0])
+    p_world_m[1] -= float(offset_xy[1])
+
     reachable, dist = is_reachable(p_world_m, ctx)
     if not reachable:
         raise ReachabilityError(
