@@ -400,8 +400,14 @@ def main():
                     print(f"  created new profile (no prior file at {args.profile})")
 
                 profile.set_robot_world_transform(last_t_robot_world)
+                # OpenCV's CharucoBoard convention: the board's +Z axis points
+                # AWAY from the markers (into the table surface for a board lying
+                # flat with markers up). The "above the table" direction is
+                # therefore the -Z direction. Save the table-plane normal as -Z
+                # so that motion_primitives.project_above_table lifts toward the
+                # camera (up) as the user expects.
                 profile.set_table_plane(
-                    normal_world=np.array([0.0, 0.0, 1.0]),
+                    normal_world=np.array([0.0, 0.0, -1.0]),
                     origin_world=np.array([0.0, 0.0, 0.0]),
                     inlier_ratio=1.0,
                     mean_abs_residual_m=0.0,

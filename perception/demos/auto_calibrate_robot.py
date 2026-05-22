@@ -440,8 +440,11 @@ def main():
         profile.set_robot_world_transform(ks.t_robot_world)
         # World frame == board frame, so the table plane is exactly Z=0 in
         # world. This is geometrically exact (no RANSAC).
+        # OpenCV's CharucoBoard convention: board +Z points AWAY from the
+        # markers (into the table for a board lying flat). "Above the table"
+        # is -Z. Save the table normal as -Z so project_above_table lifts up.
         profile.set_table_plane(
-            normal_world=np.array([0.0, 0.0, 1.0]),
+            normal_world=np.array([0.0, 0.0, -1.0]),
             origin_world=np.array([0.0, 0.0, 0.0]),
             inlier_ratio=1.0,
             mean_abs_residual_m=0.0,
