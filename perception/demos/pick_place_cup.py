@@ -200,8 +200,10 @@ def main() -> None:
         help="World-frame destination XYZ in mm (default 0 0 0 = board origin)."
     )
     parser.add_argument(
-        "--hover-mm", type=float, default=80.0,
-        help="Transport altitude above the table, in mm (also used for pre_grasp + final back-off)."
+        "--hover-mm", type=float, default=50.0,
+        help="Transport altitude above the table, in mm (also used for pre_grasp + final back-off). "
+             "With the 125 mm AG tool, going much above 60 mm pushes the flange past the arm's "
+             "physical reach; 50 mm clears a 50 mm cup with 25 mm of headroom."
     )
     parser.add_argument(
         "--release-mm", type=float, default=30.0,
@@ -224,8 +226,9 @@ def main() -> None:
         help="Arm cartesian speed (1-100)."
     )
     parser.add_argument(
-        "--max-reach-mm", type=float, default=270.0,
-        help="Conservative reach gate."
+        "--max-reach-mm", type=float, default=320.0,
+        help="Tip-reach gate (mm). Default 320 accommodates the AG-equipped flange's wider envelope; "
+             "the tip itself stays well within physical reach because the 125 mm tool extends downward."
     )
     parser.add_argument(
         "--rpy", type=float, nargs=3, default=None,
