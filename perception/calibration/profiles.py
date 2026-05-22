@@ -29,6 +29,7 @@ class CharucoBoardSpec:
     square_length_m: float = 0.02
     marker_length_m: float = 0.015
     dictionary_name: str = "DICT_4X4_50"
+    legacy_pattern: bool = True
 
 
 @dataclass
@@ -112,8 +113,8 @@ class CalibrationProfile:
             data: Dict[str, Any] = {
                 k: getattr(spec, k) for k in (
                     "squares_x", "squares_y", "square_length_m",
-                    "marker_length_m", "dictionary_name",
-                )
+                    "marker_length_m", "dictionary_name", "legacy_pattern",
+                ) if hasattr(spec, k)
             }
         else:
             data = dict(spec)

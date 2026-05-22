@@ -28,12 +28,21 @@ class CharucoBoardConfig:
     Letter paper (8.5x11 in = 21.6x27.94 cm) fits ~10x13 squares at 2 cm; we
     default to 7x10 leaving generous margins so the entire board (including
     the outer black border ArUco needs) sits on the page.
+
+    `legacy_pattern`: OpenCV 4.7 changed the ChArUco marker placement
+    convention. Boards generated with OpenCV <= 4.6 (or popular tools like
+    chev.me/arucogen, calib.io) use the LEGACY layout, where the top-left
+    square holds an ArUco marker. OpenCV 4.7+ defaults to a NEW layout where
+    the top-left square is BLACK. If your printed board has a marker in the
+    top-left square, set `legacy_pattern=True`; if it has a black square at
+    top-left, set False. Default True because pre-printed boards usually do.
     """
     squares_x: int = 7
     squares_y: int = 10
     square_length_m: float = 0.020
     marker_length_m: float = 0.015
     dictionary_name: str = "DICT_4X4_50"
+    legacy_pattern: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -69,6 +78,7 @@ def _resolve_dictionary(cv2_module, name: str):
 
 def _build_board(cv2_module, cfg: CharucoBoardConfig):
     dictionary = _resolve_dictionary(cv2_module, cfg.dictionary_name)
+    board = None
     # opencv 4.7+ constructor expects (size_tuple, square, marker, dict)
     if hasattr(cv2_module.aruco, "CharucoBoard"):
         try:
@@ -78,10 +88,9 @@ def _build_board(cv2_module, cfg: CharucoBoardConfig):
                 float(cfg.marker_length_m),
                 dictionary,
             )
-            return dictionary, board
         except TypeError:
-            pass  # fall through to older API below
-    if hasattr(cv2_module.aruco, "CharucoBoard_create"):
+            board = None
+    if board is None and hasattr(cv2_module.aruco, "CharucoBoard_create"):
         board = cv2_module.aruco.CharucoBoard_create(
             int(cfg.squares_x),
             int(cfg.squares_y),
@@ -89,10 +98,18 @@ def _build_board(cv2_module, cfg: CharucoBoardConfig):
             float(cfg.marker_length_m),
             dictionary,
         )
-        return dictionary, board
-    raise RuntimeError(
-        "opencv.aruco missing CharucoBoard constructor. Install opencv-contrib-python."
-    )
+    if board is None:
+        raise RuntimeError(
+            "opencv.aruco missing CharucoBoard constructor. Install opencv-contrib-python."
+        )
+    # opencv 4.7+: switch the marker placement to the legacy (<= 4.6) convention
+    # if the user's printed board has a marker in the top-left square.
+    if bool(cfg.legacy_pattern) and hasattr(board, "setLegacyPattern"):
+        try:
+            board.setLegacyPattern(True)
+        except Exception:
+            pass
+    return dictionary, board
 
 
 def _detect_markers(cv2_module, gray: np.ndarray, dictionary):

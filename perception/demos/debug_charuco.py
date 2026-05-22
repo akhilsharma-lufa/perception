@@ -36,6 +36,17 @@ def main():
     p.add_argument("--square-mm", type=float, default=20.0)
     p.add_argument("--marker-mm", type=float, default=14.0)
     p.add_argument("--dict", default="DICT_4X4_50")
+    p.add_argument(
+        "--legacy-pattern",
+        dest="legacy_pattern",
+        action="store_true",
+        default=True,
+    )
+    p.add_argument(
+        "--no-legacy-pattern",
+        dest="legacy_pattern",
+        action="store_false",
+    )
     p.add_argument("--save", default="charuco_debug.png")
     p.add_argument(
         "--frames",
@@ -53,6 +64,7 @@ def main():
         square_length_m=float(args.square_mm) * 1e-3,
         marker_length_m=float(args.marker_mm) * 1e-3,
         dictionary_name=str(args.dict),
+        legacy_pattern=bool(args.legacy_pattern),
     )
     dictionary, board = _build_board(cv2, cfg)
     print(f"[debug] cv2={cv2.__version__}")

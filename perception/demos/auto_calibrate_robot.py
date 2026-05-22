@@ -79,6 +79,23 @@ def main():
     parser.add_argument("--square-mm", type=float, default=20.0)
     parser.add_argument("--marker-mm", type=float, default=15.0)
     parser.add_argument("--dict", default="DICT_4X4_50")
+    parser.add_argument(
+        "--legacy-pattern",
+        dest="legacy_pattern",
+        action="store_true",
+        default=True,
+        help=(
+            "Use the legacy ChArUco marker placement (top-left square is a "
+            "TAG, not black). This is the convention used by most pre-printed "
+            "boards and by OpenCV <= 4.6. Default ON."
+        ),
+    )
+    parser.add_argument(
+        "--no-legacy-pattern",
+        dest="legacy_pattern",
+        action="store_false",
+        help="Use the OpenCV 4.7+ default layout (top-left square is BLACK).",
+    )
     # Tip & sampling
     parser.add_argument("--tip-offset-mm", type=float, default=12.0)
     parser.add_argument("--frames-per-waypoint", type=int, default=10)
@@ -135,6 +152,7 @@ def main():
         square_length_m=float(args.square_mm) * 1e-3,
         marker_length_m=float(args.marker_mm) * 1e-3,
         dictionary_name=str(args.dict),
+        legacy_pattern=bool(args.legacy_pattern),
     )
     tip_settings = TipDetectorSettings()
     auto_cfg = AutoCalibratorSettings(
@@ -348,6 +366,7 @@ def main():
                     square_length_m=board_cfg.square_length_m,
                     marker_length_m=board_cfg.marker_length_m,
                     dictionary_name=board_cfg.dictionary_name,
+                    legacy_pattern=board_cfg.legacy_pattern,
                 )
             )
             print(f"[auto-cal] created new profile (no prior file at {args.profile})")
@@ -368,6 +387,7 @@ def main():
                 square_length_m=board_cfg.square_length_m,
                 marker_length_m=board_cfg.marker_length_m,
                 dictionary_name=board_cfg.dictionary_name,
+                legacy_pattern=board_cfg.legacy_pattern,
             )
         )
         profile.metrics = {

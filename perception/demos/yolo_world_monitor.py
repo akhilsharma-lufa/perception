@@ -330,6 +330,9 @@ def main():
             args.dict if args.dict is not None
             else (board_from_profile.dictionary_name if board_from_profile else "DICT_4X4_50")
         ),
+        legacy_pattern=bool(
+            board_from_profile.legacy_pattern if board_from_profile else True
+        ),
     )
     if board_from_profile is None:
         print(
