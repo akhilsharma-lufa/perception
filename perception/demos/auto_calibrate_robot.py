@@ -43,6 +43,7 @@ from perception.calibration.charuco_board import (
 from perception.calibration.tip_detector import TipDetectorSettings
 from perception.calibration.auto_robot_calibrator import (
     AutoCalibratorSettings,
+    capture_reference_depth,
     collect_samples,
     fit_robot_world,
 )
@@ -293,6 +294,24 @@ def main():
         except Exception as exc:
             print(f"[auto-cal] could not read post-home angles: {exc}")
 
+        # --- Capture reference depth (arm at home) ----------------------
+        # Used by the tip detector to filter out static objects from the
+        # depth-peak search. Without this, monitors / robot base / tripod
+        # parts higher than the arm tip dominate every frame.
+        print("[auto-cal] capturing reference depth (arm at home)...")
+        reference_depth = capture_reference_depth(source, n_frames=5)
+        if reference_depth is None:
+            print(
+                "[auto-cal] WARN: could not capture reference depth; "
+                "tip detection will fall back to raw depth-peak (less robust)."
+            )
+        else:
+            n_valid = int(np.count_nonzero(np.isfinite(reference_depth) & (reference_depth > 0)))
+            print(
+                f"[auto-cal]   reference depth: shape={reference_depth.shape}, "
+                f"{n_valid} valid pixels"
+            )
+
         # --- Sweep --------------------------------------------------------
         n_offsets = len(auto_cfg.waypoint_offsets_deg)
         sweep_centers = [auto_cfg.j1_center_deg]
@@ -328,7 +347,10 @@ def main():
                             break
                         time.sleep(0.15)
             auto_cfg.j1_center_deg = float(center)
-            samples.extend(collect_samples(driver, source, board_cfg, auto_cfg))
+            samples.extend(collect_samples(
+                driver, source, board_cfg, auto_cfg,
+                reference_depth=reference_depth,
+            ))
         elapsed = time.monotonic() - t0
         print(
             f"[auto-cal] sweep done in {elapsed:.1f}s; "

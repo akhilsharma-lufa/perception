@@ -165,11 +165,39 @@ def _drain_stale_frames(source: Record3DSource, n: int = 2) -> None:
         source.wait_for_frame(timeout_s=0.1)
 
 
+def capture_reference_depth(
+    source: Record3DSource,
+    n_frames: int = 5,
+    timeout_s: float = 0.5,
+) -> Optional[np.ndarray]:
+    """Capture a clean reference depth frame for change-detection masking.
+
+    Average the median across `n_frames` consecutive frames to suppress per-
+    frame noise. Should be called with the arm at home (not moving) so the
+    reference represents the static scene + the home-pose arm position.
+    """
+    stack: List[np.ndarray] = []
+    for _ in range(int(n_frames) * 3):
+        pkt = source.wait_for_frame(timeout_s=float(timeout_s))
+        if pkt is None:
+            continue
+        stack.append(np.asarray(pkt.depth, dtype=np.float32))
+        if len(stack) >= int(n_frames):
+            break
+    if not stack:
+        return None
+    # Median across frames is robust to flicker; invalid pixels remain invalid
+    # because median of NaNs is NaN.
+    arr = np.stack(stack, axis=0)
+    return np.nanmedian(arr, axis=0)
+
+
 def collect_samples(
     driver: MyCobotDriver,
     source: Record3DSource,
     board_cfg: CharucoBoardConfig,
     settings: AutoCalibratorSettings,
+    reference_depth: Optional[np.ndarray] = None,
 ) -> List[SamplePoint]:
     samples: List[SamplePoint] = []
     resolved = settings.resolved_waypoints_deg()
@@ -211,6 +239,7 @@ def collect_samples(
                 packet.intrinsic_mat,
                 det.t_camera_board,
                 settings.tip_settings,
+                reference_depth=reference_depth,
             )
             if tip_cam is None:
                 continue

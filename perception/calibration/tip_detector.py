@@ -36,6 +36,11 @@ class TipDetectorSettings:
     median_window_px: int = 5
     # Minimum pixels that survive the height band to call the frame a detection.
     min_peak_pixels: int = 5
+    # Minimum depth change (m) vs. the reference frame to count a pixel as
+    # "moved" when a reference depth is provided. Filters out static objects
+    # (robot base, tripod, shelves) that are higher than the arm tip and would
+    # otherwise win the depth-peak. Set to 0 to disable change-masking.
+    min_change_vs_reference_m: float = 0.03
 
 
 def _unproject(
@@ -60,8 +65,18 @@ def detect_tip_in_camera(
     intrinsic_rgb_3x3: np.ndarray,
     t_camera_board: np.ndarray,
     settings: Optional[TipDetectorSettings] = None,
+    reference_depth: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
-    """Return the pointer tip XYZ in camera frame, or None if no peak found."""
+    """Return the pointer tip XYZ in camera frame, or None if no peak found.
+
+    If `reference_depth` is provided, pixels whose depth has not changed
+    significantly (vs. cfg.min_change_vs_reference_m) compared to that
+    reference frame are excluded. This eliminates static objects (robot base,
+    tripod, monitors) from the depth-peak search, leaving only pixels that
+    actually moved between the reference snapshot and the current frame.
+    The reference frame should be captured with the arm at home BEFORE any
+    waypoint motion.
+    """
     cfg = settings or TipDetectorSettings()
     rgb_h, rgb_w = rgb.shape[:2]
     depth_h, depth_w = depth.shape[:2]
@@ -72,6 +87,27 @@ def detect_tip_in_camera(
     )
 
     valid = np.isfinite(depth) & (depth > 0.0)
+    if reference_depth is not None and float(cfg.min_change_vs_reference_m) > 0.0:
+        # Compare to reference; pixels with similar depth in both frames are
+        # "static" and get excluded. A pixel that became valid (was invalid
+        # in reference, now valid) is counted as motion.
+        ref = np.asarray(reference_depth, dtype=np.float32)
+        if ref.shape != depth.shape:
+            # Shape mismatch -> skip change-mask rather than misalign data.
+            pass
+        else:
+            ref_valid = np.isfinite(ref) & (ref > 0.0)
+            both_valid = valid & ref_valid
+            delta = np.zeros_like(depth, dtype=np.float64)
+            delta[both_valid] = np.abs(
+                depth[both_valid].astype(np.float64) - ref[both_valid].astype(np.float64)
+            )
+            change_mask = both_valid & (delta > float(cfg.min_change_vs_reference_m))
+            # Pixels that are valid now but were invalid in reference also
+            # count as motion (the arm moved into an unmapped region).
+            new_pixels = valid & (~ref_valid)
+            valid = change_mask | new_pixels
+
     if int(np.count_nonzero(valid)) < cfg.min_peak_pixels:
         return None
 
