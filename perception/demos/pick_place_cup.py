@@ -222,6 +222,17 @@ def main() -> None:
         help="Ignore detections below this confidence."
     )
     parser.add_argument(
+        "--xy-bias-mm", type=float, nargs=2, default=[0.0, 0.0],
+        metavar=("DX", "DY"),
+        help="Constant XY offset added to the detected cup world XY before "
+             "the arm goes there (mm). Compensates for YOLO centroid bias — "
+             "the mask sees only the camera-facing side of the cup, so the "
+             "3D centroid sits toward the camera from the true cup axis. "
+             "If the gripper consistently lands 10 mm short toward the camera, "
+             "pass --xy-bias-mm 10 8 (or whatever direction takes the centroid "
+             "back to the cup's true center)."
+    )
+    parser.add_argument(
         "--speed", type=int, default=20,
         help="Arm cartesian speed (1-100)."
     )
@@ -326,9 +337,21 @@ def main() -> None:
             print(f"[pick_place] ABORT: no '{args.target_label}' detection.")
             sys.exit(4)
         cup_world, conf, n_samples = result
-        print(f"[pick_place] picked cup: world=({cup_world[0]*1000:+.1f}, "
+        print(f"[pick_place] detected cup: world=({cup_world[0]*1000:+.1f}, "
               f"{cup_world[1]*1000:+.1f}, {cup_world[2]*1000:+.1f}) mm  "
               f"conf={conf:.2f}  n_samples={n_samples}")
+        # Apply manual XY bias correction (centroid-bias compensation).
+        bias_dx_m = float(args.xy_bias_mm[0]) * 1e-3
+        bias_dy_m = float(args.xy_bias_mm[1]) * 1e-3
+        if bias_dx_m != 0.0 or bias_dy_m != 0.0:
+            cup_world = np.array(
+                [cup_world[0] + bias_dx_m, cup_world[1] + bias_dy_m, cup_world[2]],
+                dtype=np.float64,
+            )
+            print(f"[pick_place] after --xy-bias ({args.xy_bias_mm[0]:+.1f}, "
+                  f"{args.xy_bias_mm[1]:+.1f}) mm: world=("
+                  f"{cup_world[0]*1000:+.1f}, {cup_world[1]*1000:+.1f}, "
+                  f"{cup_world[2]*1000:+.1f}) mm")
     finally:
         source.disconnect()
 
@@ -426,7 +449,18 @@ def main() -> None:
             _log_gripper("back-off")
 
             print("[pick_place] (6/6) home ...")
+            # driver.home()'s wait_until_done can return early on this firmware
+            # (is_moving() reports 0 before the motion actually begins). Force
+            # a settle: send home, then sleep long enough for the joints to
+            # complete the swing at the configured speed, then verify pose.
             home(driver, gripper, speed=int(args.speed))
+            time.sleep(4.0)
+            try:
+                angles = driver.get_angles_deg(retries=4)
+                print(f"[pick_place]   angles AFTER home: "
+                      f"{[round(a, 1) for a in angles]}")
+            except Exception as exc:
+                print(f"[pick_place]   angles AFTER home: read failed: {exc}")
             _log_pose("home")
             _log_gripper("home")
             print("[pick_place] done.")
