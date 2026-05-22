@@ -13,11 +13,19 @@ class GripperSettings:
     # AG gripper TCP offset along tool0-Z (meters). Refined in v2 via touch-cal.
     tip_offset_z_m: float = 0.095
     default_speed: int = 50
-    # pymycobot value range for AG: 0 = fully open, 100 = fully closed.
+    # Public convention everywhere in the codebase: 0 = open, 100 = closed.
     open_value: int = 0
     close_value_default: int = 80
     # Close value tuned for the small plastic shot cup (~4 cm dia). Tune live.
     close_value_shot_cup: int = 40
+    # The MyCobot AG firmware on THIS unit interprets value INVERTED from the
+    # documented convention: sending 0 makes fingers CLOSE, sending 100 makes
+    # them OPEN. Set True to flip every value at the API boundary so all
+    # callers (and CLI flags like --grasp-close-value 70) keep using the
+    # documented "0=open, 100=closed" convention; the Gripper class will send
+    # (100 - value) to the firmware. If you swap to a gripper unit that obeys
+    # the documented convention, flip this to False.
+    invert_polarity: bool = True
     # Time to wait when pymycobot does not expose is_gripper_moving cleanly.
     blocking_wait_s: float = 1.0
     # Gripper mode: 0 = transparent (drive cleanly), 1 = io protocol on the AG.
@@ -53,13 +61,23 @@ class Gripper:
         self._mode_set = True
 
     def set_width(self, value_0_100: int, speed: Optional[int] = None, wait: bool = True) -> None:
-        """value: 0 = fully open, 100 = fully closed. pymycobot's convention."""
+        """value: 0 = fully open, 100 = fully closed. pymycobot's convention.
+
+        On hardware with `invert_polarity=True`, the firmware-bound value is
+        flipped (100 - v) before being sent, so callers always use the same
+        0=open / 100=closed convention regardless of which gripper unit is
+        installed.
+        """
         self.ensure_mode()
         mc = self._mc()
         v = int(max(0, min(100, value_0_100)))
+        if bool(self.settings.invert_polarity):
+            wire_v = 100 - v
+        else:
+            wire_v = v
         s = int(speed if speed is not None else self.settings.default_speed)
         s = max(1, min(100, s))
-        mc.set_gripper_value(v, s)
+        mc.set_gripper_value(wire_v, s)
         if wait:
             self.wait_until_done()
 
@@ -102,6 +120,8 @@ class Gripper:
             time.sleep(0.05)
 
     def get_value(self) -> Optional[int]:
+        """Returns the gripper position in the public convention
+        (0 = open, 100 = closed), regardless of hardware polarity."""
         mc = self._mc()
         try:
             v = mc.get_gripper_value()
@@ -110,6 +130,9 @@ class Gripper:
         if v is None:
             return None
         try:
-            return int(v)
+            raw = int(v)
         except (TypeError, ValueError):
             return None
+        if bool(self.settings.invert_polarity):
+            return 100 - raw
+        return raw
