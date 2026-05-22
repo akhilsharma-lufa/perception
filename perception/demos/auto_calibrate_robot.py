@@ -282,13 +282,13 @@ def main():
             print(f"[auto-cal] could not read post-home angles: {exc}")
 
         # --- Sweep --------------------------------------------------------
-        print(f"[auto-cal] sweeping {len(auto_cfg.waypoints_deg)} waypoints...")
+        print(f"[auto-cal] sweeping {len(auto_cfg.waypoint_offsets_deg)} waypoints...")
         t0 = time.monotonic()
         samples = collect_samples(driver, source, board_cfg, auto_cfg)
         elapsed = time.monotonic() - t0
         print(
             f"[auto-cal] sweep done in {elapsed:.1f}s; "
-            f"{len(samples)}/{len(auto_cfg.waypoints_deg)} samples valid"
+            f"{len(samples)}/{len(auto_cfg.waypoint_offsets_deg)} samples valid"
         )
 
         if int(args.max_waypoints) > 0 and int(args.max_waypoints) < auto_cfg.min_inlier_samples:
