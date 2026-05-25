@@ -84,6 +84,16 @@ def main() -> None:
         help="Conservative reach gate (default 270 mm).",
     )
     parser.add_argument(
+        "--tip-offset-mm",
+        type=float,
+        default=None,
+        help="Override the flange->tip distance along tool +Z (mm). Defaults "
+             "to MotionSettings.tip_offset_z_m (125 mm, the AG gripper). Pass "
+             "the actual length of the currently mounted tool (e.g. 12 for a "
+             "12 mm pointer). When set, the tool0 XY offset is also zeroed on "
+             "the assumption that an overridden tool is on the centerline.",
+    )
+    parser.add_argument(
         "--coord-mode",
         type=int,
         choices=[0, 1],
@@ -150,7 +160,7 @@ def main() -> None:
     t_robot_world = profile.get_robot_world_transform()
     n_world, o_world = profile.table_plane.as_arrays()
 
-    settings = MotionSettings(
+    settings_kwargs: dict = dict(
         max_reach_m=float(args.max_reach_mm) * 1e-3,
         default_speed=int(args.speed),
         vertical_rpy_deg=(
@@ -160,6 +170,15 @@ def main() -> None:
         ),
         coord_mode=int(args.coord_mode),
     )
+    if args.tip_offset_mm is not None:
+        settings_kwargs["tip_offset_z_m"] = float(args.tip_offset_mm) * 1e-3
+        settings_kwargs["tip_offset_tool0_xy_m"] = (0.0, 0.0)
+        print(
+            f"[goto_world] tool override: tip_offset_z_m="
+            f"{settings_kwargs['tip_offset_z_m']*1000:.1f} mm, "
+            f"tip_offset_tool0_xy_m=(0.0, 0.0) mm"
+        )
+    settings = MotionSettings(**settings_kwargs)
     ctx = MotionContext(
         t_robot_world=t_robot_world,
         table_normal_world=n_world,
