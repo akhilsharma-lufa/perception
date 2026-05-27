@@ -31,6 +31,7 @@ import argparse
 import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -40,6 +41,7 @@ from perception.calibration.charuco_board import (
     detect_board_pose,
 )
 from perception.control import (
+    CollisionError,
     Gripper,
     GripperSettings,
     MotionContext,
@@ -47,12 +49,20 @@ from perception.control import (
     MyCobotDriver,
     MyCobotDriverSettings,
     ReachabilityError,
+    approach_and_grasp,
     descend_and_grasp,
     is_reachable,
     lift,
     place,
     pre_grasp,
+    retreat_along_approach,
     safe_home,
+)
+from perception.control.grasp_planner import (
+    GraspInfeasible,
+    GraspPlannerSettings,
+    GripperGeom,
+    plan_grasp,
 )
 from perception.detection import YoloDetectorSettings, YoloObjectDetector
 from perception.geometry.transforms import invert_transform
@@ -89,6 +99,39 @@ def _resolve_board_config(profile, args) -> CharucoBoardConfig:
     )
 
 
+def _approach_yaw_toward_base(cup_world_m: np.ndarray, ctx) -> float:
+    """In-plane heading (rad) so the angled approach comes from the robot-base side.
+
+    Uses the same plane basis as grasp_planner. Returns the yaw whose +heading
+    points from the cup toward the robot base, so the gripper stands off on the
+    base side and tilts in over the cup — keeping the arm in its comfortable arc.
+    """
+    n = np.asarray(ctx.table_normal_world, dtype=np.float64).reshape(3)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = ref - np.dot(ref, n) * n
+    u = u / (np.linalg.norm(u) + 1e-12)
+    v = np.cross(n, u)
+    base_world = np.linalg.inv(np.asarray(ctx.t_robot_world, dtype=np.float64))[:3, 3]
+    h = np.asarray(base_world, dtype=np.float64) - np.asarray(cup_world_m, dtype=np.float64).reshape(3)
+    h = h - np.dot(h, n) * n
+    if np.linalg.norm(h) < 1e-6:
+        return 0.0
+    return float(np.arctan2(np.dot(h, v), np.dot(h, u)))
+
+
+@dataclass
+class CupObservation:
+    """Aggregated perception of the target: de-biased world position plus the
+    upright object model (radius/height) the grasp planner consumes."""
+    position_world_m: np.ndarray
+    confidence: float
+    n_samples: int
+    radius_m: float | None
+    base_radius_m: float | None
+    height_m: float | None
+
+
 def _observe_cup(
     source: Record3DSource,
     detector: YoloObjectDetector,
@@ -97,15 +140,17 @@ def _observe_cup(
     target_label: str,
     min_confidence: float,
     window_s: float,
-) -> tuple[np.ndarray, float, int] | None:
-    """Run detection for `window_s` seconds; return (world_xyz_m, median_conf,
-    n_samples) for the best matching target, or None if no candidate.
+) -> CupObservation | None:
+    """Run detection for `window_s` seconds; return a `CupObservation` for the best
+    matching target, or None if no candidate.
 
-    Best = label-match with most samples; ties broken by higher median
-    confidence. Position is the median XYZ across the candidate's samples.
+    Best = label-match with most samples; ties broken by higher median confidence.
+    Position is the median (de-biased axis center) XYZ across the candidate's
+    samples; radius/height are medians of the per-frame object-model fits.
     """
     localizer_cfg = RgbdLocalizerSettings()
-    samples: dict[tuple[int, int], list[tuple[np.ndarray, float]]] = defaultdict(list)
+    # Each sample: (position_xyz, confidence, radius_m|nan, base_radius_m|nan, height_m|nan)
+    samples: dict[tuple[int, int], list[tuple[np.ndarray, float, float, float, float]]] = defaultdict(list)
 
     deadline = time.monotonic() + float(window_s)
     n_frames = 0
@@ -155,8 +200,13 @@ def _observe_cup(
             # together across frames (5 cm grid is generous for a 5 cm cup).
             x_mm, y_mm, _ = out_obj.position_world_xyz_m
             key = (int(round(x_mm * 1000.0 / 50.0)), int(round(y_mm * 1000.0 / 50.0)))
-            samples[key].append((np.asarray(out_obj.position_world_xyz_m, dtype=np.float64),
-                                 float(det.confidence)))
+            samples[key].append((
+                np.asarray(out_obj.position_world_xyz_m, dtype=np.float64),
+                float(det.confidence),
+                float(out_obj.radius_m) if out_obj.radius_m is not None else float("nan"),
+                float(out_obj.base_radius_m) if out_obj.base_radius_m is not None else float("nan"),
+                float(out_obj.height_m) if out_obj.height_m is not None else float("nan"),
+            ))
 
     print(f"[pick_place] observed {n_frames} frames; "
           f"anchor ok={n_anchor_ok} fail={n_anchor_fail}; "
@@ -166,16 +216,25 @@ def _observe_cup(
 
     def _bucket_score(item):
         _, sample_list = item
-        confs = np.asarray([c for _, c in sample_list], dtype=np.float64)
+        confs = np.asarray([s[1] for s in sample_list], dtype=np.float64)
         return (len(sample_list), float(np.median(confs)))
 
     best_key, best_samples = max(samples.items(), key=_bucket_score)
-    positions = np.stack([p for p, _ in best_samples], axis=0)
-    confs = np.asarray([c for _, c in best_samples], dtype=np.float64)
-    return (
-        np.median(positions, axis=0),
-        float(np.median(confs)),
-        int(len(best_samples)),
+    positions = np.stack([s[0] for s in best_samples], axis=0)
+    confs = np.asarray([s[1] for s in best_samples], dtype=np.float64)
+
+    def _median_or_none(col: int) -> float | None:
+        vals = np.asarray([s[col] for s in best_samples], dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        return float(np.median(vals)) if vals.size else None
+
+    return CupObservation(
+        position_world_m=np.median(positions, axis=0),
+        confidence=float(np.median(confs)),
+        n_samples=int(len(best_samples)),
+        radius_m=_median_or_none(2),
+        base_radius_m=_median_or_none(3),
+        height_m=_median_or_none(4),
     )
 
 
@@ -262,6 +321,20 @@ def main() -> None:
     parser.add_argument("--square-mm", type=float, default=None)
     parser.add_argument("--marker-mm", type=float, default=None)
     parser.add_argument("--dict", default=None)
+    # --- Grasp planning (object model -> approach) ---
+    parser.add_argument("--gripper-min-gap-mm", type=float, default=20.0,
+                        help="Gripper closed finger gap (mm).")
+    parser.add_argument("--gripper-max-gap-mm", type=float, default=45.0,
+                        help="Gripper open finger gap (mm); the grasp must fit inside this.")
+    parser.add_argument("--grip-clearance-mm", type=float, default=6.0,
+                        help="Clearance subtracted from max gap so open fingers clear the object.")
+    parser.add_argument("--approach-tilt-deg", type=float, default=45.0,
+                        help="Tilt from vertical for the angled approach (0=top-down, 90=horizontal).")
+    parser.add_argument("--standoff-mm", type=float, default=60.0,
+                        help="Pre-grasp standoff distance back along the approach axis (mm).")
+    parser.add_argument("--force-top-down", action="store_true",
+                        help="Skip the planner's angled decision and force a vertical grasp "
+                             "(only safe when the object fits the open gripper from above).")
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Detect and print the plan; do not move the arm."
@@ -350,10 +423,14 @@ def main() -> None:
         if result is None:
             print(f"[pick_place] ABORT: no '{args.target_label}' detection.")
             sys.exit(4)
-        cup_world, conf, n_samples = result
+        cup_world = result.position_world_m
+        conf, n_samples = result.confidence, result.n_samples
+        obs = result
+        rad_str = "n/a" if obs.radius_m is None else f"{obs.radius_m*2000:.1f}mm Ø"
+        h_str = "n/a" if obs.height_m is None else f"{obs.height_m*1000:.1f}mm"
         print(f"[pick_place] detected cup: world=({cup_world[0]*1000:+.1f}, "
               f"{cup_world[1]*1000:+.1f}, {cup_world[2]*1000:+.1f}) mm  "
-              f"conf={conf:.2f}  n_samples={n_samples}")
+              f"conf={conf:.2f}  n_samples={n_samples}  model: max {rad_str}, height {h_str}")
         # Apply manual XY bias correction (centroid-bias compensation).
         bias_dx_m = float(args.xy_bias_mm[0]) * 1e-3
         bias_dy_m = float(args.xy_bias_mm[1]) * 1e-3
@@ -385,15 +462,62 @@ def main() -> None:
               "Try --place-mm 100 70 0 (board center).")
         sys.exit(3)
 
+    # --- Grasp planning: object model -> grasp + approach ------------------
+    grasp_plan = None
+    if obs.radius_m is not None and obs.height_m is not None and not args.force_top_down:
+        n_world, o_world = profile.table_plane.as_arrays()
+        gripper_geom = GripperGeom(
+            min_gap_m=float(args.gripper_min_gap_mm) * 1e-3,
+            max_gap_m=float(args.gripper_max_gap_mm) * 1e-3,
+            grip_clearance_m=float(args.grip_clearance_mm) * 1e-3,
+        )
+        planner_settings = GraspPlannerSettings(
+            approach_tilt_deg=float(args.approach_tilt_deg),
+            approach_yaw_rad=_approach_yaw_toward_base(cup_world, ctx),
+            standoff_m=float(args.standoff_mm) * 1e-3,
+        )
+        try:
+            grasp_plan = plan_grasp(
+                axis_center_world_m=cup_world,
+                height_m=float(obs.height_m),
+                radius_m=float(obs.radius_m),
+                base_radius_m=obs.base_radius_m,
+                plane_normal_world=n_world,
+                plane_origin_world=o_world,
+                gripper=gripper_geom,
+                settings=planner_settings,
+            )
+        except GraspInfeasible as exc:
+            print(f"[pick_place] ABORT: object not graspable: {exc}")
+            sys.exit(5)
+        # Angled approaches need the tool-collision guard active.
+        if grasp_plan.mode == "angled":
+            ctx.settings.enable_collision_check = True
+    else:
+        reason = ("--force-top-down" if args.force_top_down
+                  else "no object model (radius/height) from perception")
+        print(f"[pick_place] no grasp plan ({reason}); using legacy top-down sequence.")
+
     print(f"[pick_place] PLAN:")
-    print(f"  1. pre_grasp     hover {args.hover_mm:.0f} mm above cup")
-    print(f"  2. descend_and_grasp  ({ctx.settings.grasp_offset_from_table_m*1000:.0f} mm above table)")
-    print(f"  3. lift               {args.hover_mm:.0f} mm")
-    print(f"  4. place              at world ({place_world[0]*1000:+.0f}, "
+    if grasp_plan is not None:
+        print(f"  grasp mode = {grasp_plan.mode.upper()}  "
+              f"grasp height {grasp_plan.grasp_height_m*1000:.1f} mm  "
+              f"Ø {grasp_plan.grasp_diameter_m*1000:.1f} mm  tilt {grasp_plan.tilt_deg:.0f}°")
+        if grasp_plan.notes:
+            print(f"  NOTE: {grasp_plan.notes}")
+        if grasp_plan.mode == "angled":
+            print(f"  1. approach_and_grasp (standoff -> grasp along approach axis, collision-checked)")
+            print(f"  2. retreat along approach axis ({args.hover_mm:.0f} mm)")
+        else:
+            print(f"  1. pre_grasp + descend_and_grasp (vertical)")
+            print(f"  2. lift {args.hover_mm:.0f} mm")
+    else:
+        print(f"  1. pre_grasp     hover {args.hover_mm:.0f} mm above cup")
+        print(f"  2. descend_and_grasp  ({ctx.settings.grasp_offset_from_table_m*1000:.0f} mm above table)")
+        print(f"  3. lift               {args.hover_mm:.0f} mm")
+    print(f"  ->  place at world ({place_world[0]*1000:+.0f}, "
           f"{place_world[1]*1000:+.0f}, {place_world[2]*1000:+.0f}) mm, "
-          f"release at {args.release_mm:.0f} mm")
-    print(f"  5. lift               {args.hover_mm:.0f} mm (back off)")
-    print(f"  6. home")
+          f"release at {args.release_mm:.0f} mm, then home")
 
     if args.dry_run:
         print("[pick_place] --dry-run; not moving.")
@@ -434,21 +558,38 @@ def main() -> None:
             time.sleep(0.3)
             _log_gripper("force-open")
 
-            print("[pick_place] (1/6) pre_grasp ...")
-            pre_grasp(driver, gripper, cup_world, ctx,
-                      hover_m=float(args.hover_mm) * 1e-3, speed=int(args.speed))
-            _log_pose("pre_grasp")
-            _log_gripper("pre_grasp")
+            if grasp_plan is not None and grasp_plan.mode == "angled":
+                print("[pick_place] (1/6) angled approach_and_grasp ...")
+                approach_and_grasp(driver, gripper, grasp_plan, ctx,
+                                   speed=int(args.speed))
+                _log_pose("approach_and_grasp")
+                _log_gripper("approach_and_grasp")
 
-            print("[pick_place] (2/6) descend_and_grasp ...")
-            descend_and_grasp(driver, gripper, cup_world, ctx, speed=int(args.speed))
-            _log_pose("descend_and_grasp")
-            _log_gripper("descend_and_grasp")
+                print("[pick_place] (2/6) retreat along approach axis ...")
+                retreat_along_approach(driver, grasp_plan, ctx,
+                                       dist_m=float(args.hover_mm) * 1e-3,
+                                       speed=int(args.speed))
+                # Collision guard is only needed for the angled grasp near the table;
+                # the vertical transit/place below is clear, so relax it.
+                ctx.settings.enable_collision_check = False
+                _log_pose("retreat")
+                _log_gripper("retreat")
+            else:
+                print("[pick_place] (1/6) pre_grasp ...")
+                pre_grasp(driver, gripper, cup_world, ctx,
+                          hover_m=float(args.hover_mm) * 1e-3, speed=int(args.speed))
+                _log_pose("pre_grasp")
+                _log_gripper("pre_grasp")
 
-            print("[pick_place] (3/6) lift ...")
-            lift(driver, ctx, lift_m=float(args.hover_mm) * 1e-3, speed=int(args.speed))
-            _log_pose("lift")
-            _log_gripper("lift")
+                print("[pick_place] (2/6) descend_and_grasp ...")
+                descend_and_grasp(driver, gripper, cup_world, ctx, speed=int(args.speed))
+                _log_pose("descend_and_grasp")
+                _log_gripper("descend_and_grasp")
+
+                print("[pick_place] (3/6) lift ...")
+                lift(driver, ctx, lift_m=float(args.hover_mm) * 1e-3, speed=int(args.speed))
+                _log_pose("lift")
+                _log_gripper("lift")
 
             print("[pick_place] (4/6) place ...")
             place(driver, gripper, place_world, ctx,
@@ -473,7 +614,14 @@ def main() -> None:
             print(f"[pick_place] done. (home {'OK' if homed else 'FAILED'})")
         except ReachabilityError as exc:
             print(f"[pick_place] reach error mid-sequence: {exc}")
+            print("[pick_place] attempting safe_home before exit ...")
+            safe_home(driver, gripper, speed=int(args.speed))
             sys.exit(3)
+        except CollisionError as exc:
+            print(f"[pick_place] COLLISION guard tripped mid-sequence: {exc}")
+            print("[pick_place] attempting safe_home before exit ...")
+            safe_home(driver, gripper, speed=int(args.speed))
+            sys.exit(6)
     finally:
         driver.disconnect()
 

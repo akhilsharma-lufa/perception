@@ -1,22 +1,28 @@
 from .gripper import Gripper, GripperSettings
 from .motion_primitives import (
+    CollisionError,
     MotionContext,
     MotionSettings,
     ReachabilityError,
+    approach_and_grasp,
+    collision_check,
     descend_and_grasp,
     home,
     is_reachable,
     lift,
     move_to_world,
+    orientation_rpy_for_approach,
     place,
     pre_grasp,
     project_above_table,
+    retreat_along_approach,
     safe_home,
     world_to_robot,
 )
 from .mycobot_driver import MyCobotDriver, MyCobotDriverSettings, RobotMotionError
 
 __all__ = [
+    "CollisionError",
     "Gripper",
     "GripperSettings",
     "MotionContext",
@@ -25,14 +31,18 @@ __all__ = [
     "MyCobotDriverSettings",
     "ReachabilityError",
     "RobotMotionError",
+    "approach_and_grasp",
+    "collision_check",
     "descend_and_grasp",
     "home",
     "is_reachable",
     "lift",
     "move_to_world",
+    "orientation_rpy_for_approach",
     "place",
     "pre_grasp",
     "project_above_table",
+    "retreat_along_approach",
     "safe_home",
     "world_to_robot",
 ]

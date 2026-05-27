@@ -28,6 +28,11 @@ class ReachabilityError(RuntimeError):
     """Raised when a target is outside the arm's reach envelope."""
 
 
+class CollisionError(RuntimeError):
+    """Raised when a planned flange pose would put the tool collision volume
+    below the table plane (e.g. the servo bump dragging on the surface)."""
+
+
 @dataclass
 class MotionSettings:
     # Conservative reach in robot frame, meters. AG-equipped MyCobot 280 has
@@ -91,6 +96,22 @@ class MotionSettings:
     # "none" is position-only. See ik_solver / kinematics.ik.
     ik_orientation_mode: str = "Z"
     ik_max_pos_err_mm: float = 3.0
+    # --- Tool collision volume (tool0 frame, meters) ---
+    # Boxes approximating the gripper so non-top-down approaches don't drag the
+    # servo bump into the table. tool0 axes: +Z = approach (flange -> fingertips),
+    # +X = finger-open axis, +Y = servo-bump side (perpendicular to finger plane).
+    # Each entry is (center_xyz, half_extents_xyz). Defaults from the AG photos
+    # (~110x90x60 mm body + a servo dome protruding ~+Y, slightly off-center in X);
+    # MEASURE and tune on hardware before trusting an angled grasp.
+    tool_collision_boxes: tuple = (
+        ((0.0, 0.0, 0.055), (0.045, 0.030, 0.055)),     # gripper body
+        ((0.008, 0.045, 0.028), (0.024, 0.024, 0.032)),  # servo bump (+Y, off-center)
+    )
+    # Minimum clearance (m) every collision-box corner must keep above the table.
+    table_clearance_m: float = 0.005
+    # Gate moves on the collision check. Off by default (top-down demos never
+    # collide); the angled-grasp path turns it on.
+    enable_collision_check: bool = False
 
 
 @dataclass
@@ -139,6 +160,88 @@ def _rpy_to_rotation_matrix(rpy_deg: Sequence[float]) -> np.ndarray:
     ry_mat = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float64)
     rz_mat = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float64)
     return rz_mat @ ry_mat @ rx_mat
+
+
+def _rotation_matrix_to_rpy_deg(R: np.ndarray) -> tuple[float, float, float]:
+    """Inverse of `_rpy_to_rotation_matrix` (R = Rz @ Ry @ Rx). Returns (rx,ry,rz) deg."""
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    sy = -R[2, 0]
+    sy = float(np.clip(sy, -1.0, 1.0))
+    cy = float(np.sqrt(max(0.0, 1.0 - sy * sy)))
+    if cy > 1e-6:
+        rx = np.arctan2(R[2, 1], R[2, 2])
+        ry = np.arctan2(sy, cy)
+        rz = np.arctan2(R[1, 0], R[0, 0])
+    else:  # gimbal lock: pitch ~ +-90 deg, fix roll = 0
+        rx = 0.0
+        ry = np.arctan2(sy, cy)
+        rz = np.arctan2(-R[0, 1], R[1, 1])
+    return (float(np.degrees(rx)), float(np.degrees(ry)), float(np.degrees(rz)))
+
+
+def orientation_rpy_for_approach(
+    approach_dir_world: Sequence[float],
+    ctx: MotionContext,
+) -> tuple[float, float, float]:
+    """Build an end-effector RPY (deg, robot frame) for an angled approach.
+
+    Aligns tool +Z with the approach direction (the way the gripper travels into
+    the object) and rolls so tool +Y (the servo-bump side) points as far UP as
+    possible, keeping the bump clear of the table. The world approach vector is
+    rotated into the robot frame via the calibrated transform.
+    """
+    r_rw = np.asarray(ctx.t_robot_world, dtype=np.float64)[:3, :3]
+    z = r_rw @ np.asarray(approach_dir_world, dtype=np.float64).reshape(3)
+    z = z / (np.linalg.norm(z) + 1e-12)
+    up = r_rw @ (np.asarray(ctx.table_normal_world, dtype=np.float64).reshape(3))
+    up = up / (np.linalg.norm(up) + 1e-12)
+    y = up - np.dot(up, z) * z
+    if np.linalg.norm(y) < 1e-6:  # approach is ~parallel to up; pick any perpendicular
+        ref = np.array([1.0, 0.0, 0.0]) if abs(z[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        y = ref - np.dot(ref, z) * z
+    y = y / (np.linalg.norm(y) + 1e-12)
+    x = np.cross(y, z)
+    x = x / (np.linalg.norm(x) + 1e-12)
+    y = np.cross(z, x)  # re-orthonormalize, right-handed (z = x cross y)
+    R = np.column_stack([x, y, z])
+    return _rotation_matrix_to_rpy_deg(R)
+
+
+def _tool_box_corners(center: Sequence[float], half: Sequence[float]) -> np.ndarray:
+    c = np.asarray(center, dtype=np.float64).reshape(3)
+    h = np.asarray(half, dtype=np.float64).reshape(3)
+    signs = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)],
+                     dtype=np.float64)
+    return c + signs * h
+
+
+def collision_check(
+    p_robot_flange_m: np.ndarray,
+    rpy_deg: Sequence[float],
+    ctx: MotionContext,
+) -> tuple[bool, float]:
+    """Check the tool collision volume against the table plane for a flange pose.
+
+    Transforms every collision-box corner (tool0 -> robot) and measures its signed
+    distance above the table plane (in robot frame). Returns (ok, min_clearance_m);
+    ok is False if any corner is closer to the table than `settings.table_clearance_m`.
+    """
+    boxes = ctx.settings.tool_collision_boxes
+    if not boxes:
+        return True, float("inf")
+    p = np.asarray(p_robot_flange_m, dtype=np.float64).reshape(3)
+    R = _rpy_to_rotation_matrix(rpy_deg)
+    r_rw = np.asarray(ctx.t_robot_world, dtype=np.float64)[:3, :3]
+    n_robot = r_rw @ np.asarray(ctx.table_normal_world, dtype=np.float64).reshape(3)
+    n_robot = n_robot / (np.linalg.norm(n_robot) + 1e-12)
+    origin_robot = world_to_robot(ctx.table_origin_world, ctx.t_robot_world)
+    min_clear = float("inf")
+    for center, half in boxes:
+        corners_tool0 = _tool_box_corners(center, half)
+        corners_robot = (R @ corners_tool0.T).T + p
+        signed = (corners_robot - origin_robot) @ n_robot
+        min_clear = min(min_clear, float(np.min(signed)))
+    return (min_clear >= float(ctx.settings.table_clearance_m)), min_clear
 
 
 def project_above_table(
@@ -254,6 +357,15 @@ def move_to_world(
         dtype=np.float64,
     )
     p_robot_flange = p_robot_tip - r_robot_tool0 @ tip_offset_tool0
+    if ctx.settings.enable_collision_check:
+        ok, clearance = collision_check(p_robot_flange, rpy, ctx)
+        if not ok:
+            raise CollisionError(
+                f"flange pose at world {tuple(round(float(v),3) for v in p_world_m)} "
+                f"rpy {tuple(round(float(v),1) for v in rpy)} puts the tool "
+                f"{clearance*1000:.1f} mm from the table (need "
+                f"{ctx.settings.table_clearance_m*1000:.1f} mm) — would collide."
+            )
     _command_flange(driver, p_robot_flange, rpy, ctx, speed=speed, wait=wait)
 
 
@@ -335,6 +447,46 @@ def place(
     release_target = project_above_table(destination_world_m, clearance, ctx)
     move_to_world(driver, release_target, ctx, speed=speed)
     gripper.open(wait=True)
+
+
+def approach_and_grasp(
+    driver: MyCobotDriver,
+    gripper: Gripper,
+    plan,
+    ctx: MotionContext,
+    speed: Optional[int] = None,
+    approach_speed: Optional[int] = None,
+) -> tuple[float, float, float]:
+    """Execute a grasp from a `GraspPlan` (grasp_planner.GraspPlan; duck-typed).
+
+    Opens the gripper, moves to the pre-grasp standoff with the plan's approach
+    orientation (tool +Z along the approach, servo bump up), advances along the
+    approach axis to the grasp point, then closes. Both moves are collision-gated
+    when `settings.enable_collision_check`. Returns the RPY used (deg).
+    """
+    rpy = orientation_rpy_for_approach(plan.approach_dir_world, ctx)
+    gripper.open(wait=True)
+    move_to_world(driver, plan.pregrasp_point_world_m, ctx, speed=speed, rpy_deg=rpy)
+    move_to_world(driver, plan.grasp_point_world_m, ctx,
+                  speed=(approach_speed if approach_speed is not None else speed), rpy_deg=rpy)
+    gripper.close(value=int(ctx.settings.grasp_close_value), wait=True)
+    return rpy
+
+
+def retreat_along_approach(
+    driver: MyCobotDriver,
+    plan,
+    ctx: MotionContext,
+    dist_m: Optional[float] = None,
+    speed: Optional[int] = None,
+) -> None:
+    """Back the grasped object straight out along the (reverse) approach axis —
+    up and away from the table — before transit, keeping the same orientation."""
+    rpy = orientation_rpy_for_approach(plan.approach_dir_world, ctx)
+    d = float(dist_m if dist_m is not None else ctx.settings.lift_height_m)
+    retreat_point = np.asarray(plan.grasp_point_world_m, dtype=np.float64) \
+        - np.asarray(plan.approach_dir_world, dtype=np.float64) * d
+    move_to_world(driver, retreat_point, ctx, speed=speed, rpy_deg=rpy)
 
 
 def home(

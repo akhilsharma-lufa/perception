@@ -31,6 +31,17 @@ class RgbdLocalizerSettings:
     # Fallback (no table plane) ring sampling for table_z estimate
     table_ring_px: int = 8
     min_table_ring_pixels: int = 40
+    # --- Object geometry model (cone/cylinder on the table plane) ---
+    # Slice thickness (m) used to gather rim (top) and base (low) footprint points
+    # for the circle fits that recover the object's axis center + radii.
+    model_rim_band_m: float = 0.015
+    model_base_band_m: float = 0.015
+    # Minimum footprint points to attempt a circle fit (else fall back to the
+    # radial-extent / centroid estimate).
+    model_min_circle_points: int = 12
+    # Reject an absurd circle fit (e.g. near-collinear arc) whose radius exceeds
+    # this, and fall back. Generous upper bound for table-top objects.
+    model_max_radius_m: float = 0.15
 
 
 def _resize_mask_to_depth(mask_rgb: np.ndarray, depth_shape: tuple[int, int]) -> np.ndarray:
@@ -115,6 +126,126 @@ def _yaw_from_points_xy(points_xy: np.ndarray, weights: Optional[np.ndarray] = N
         return None
     axis = eigvecs[:, int(np.argmax(eigvals))]
     return float(np.arctan2(axis[1], axis[0]))
+
+
+def _plane_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return two orthonormal in-plane axes (u, v) for a plane with `normal`."""
+    n = np.asarray(normal, dtype=np.float64).reshape(3)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    # Pick a reference axis least parallel to n, project it out.
+    ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = ref - np.dot(ref, n) * n
+    u = u / (np.linalg.norm(u) + 1e-12)
+    v = np.cross(n, u)
+    return u, v
+
+
+def _fit_circle_2d(xy: np.ndarray) -> Optional[tuple[float, float, float]]:
+    """Algebraic (Kåsa) circle fit. Returns (cx, cy, r) or None.
+
+    Recovers the true center from even a partial arc (e.g. the camera-facing half
+    of a cup rim), which a centroid cannot. Ill-conditioned (near-collinear) inputs
+    return None so the caller can fall back.
+    """
+    pts = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    if pts.shape[0] < 3:
+        return None
+    x = pts[:, 0]
+    y = pts[:, 1]
+    a_mat = np.column_stack([x, y, np.ones_like(x)])
+    b = x * x + y * y
+    try:
+        sol, *_ = np.linalg.lstsq(a_mat, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    cx = sol[0] / 2.0
+    cy = sol[1] / 2.0
+    r2 = sol[2] + cx * cx + cy * cy
+    if not np.isfinite(r2) or r2 <= 0.0:
+        return None
+    return float(cx), float(cy), float(np.sqrt(r2))
+
+
+def _slice_radius(
+    footprint_uv: np.ndarray,
+    center_uv: tuple[float, float],
+    min_points: int,
+    max_radius_m: float,
+) -> Optional[float]:
+    """Best radius estimate for a footprint slice: circle fit, else robust radial
+    extent (high percentile of distance-to-center)."""
+    if footprint_uv.shape[0] == 0:
+        return None
+    fit = _fit_circle_2d(footprint_uv) if footprint_uv.shape[0] >= min_points else None
+    if fit is not None and 0.0 < fit[2] <= max_radius_m:
+        return fit[2]
+    d = np.linalg.norm(footprint_uv - np.asarray(center_uv, dtype=np.float64), axis=1)
+    if d.size == 0:
+        return None
+    return float(min(np.percentile(d, 90.0), max_radius_m))
+
+
+def _fit_object_model(
+    pts_world: np.ndarray,
+    weights: np.ndarray,
+    plane_normal: np.ndarray,
+    plane_origin: np.ndarray,
+    height_m: float,
+    cfg: "RgbdLocalizerSettings",
+) -> Optional[tuple[np.ndarray, float, float]]:
+    """Fit an upright solid to the object's points on the table plane.
+
+    Returns (axis_center_world_xyz, radius_m, base_radius_m) or None if there is
+    not enough geometry. `axis_center_world` is the de-biased object axis projected
+    onto the table plane; `radius_m` is the max (rim) radius — the collision bound;
+    `base_radius_m` is a low slice's radius. Recovering the center from a circle fit
+    removes the camera-facing-half bias of a raw centroid.
+    """
+    u, v = _plane_basis(plane_normal)
+    origin = np.asarray(plane_origin, dtype=np.float64).reshape(3)
+    rel = pts_world - origin
+    h = rel @ np.asarray(plane_normal, dtype=np.float64).reshape(3)
+    uu = rel @ u
+    vv = rel @ v
+    footprint = np.column_stack([uu, vv])
+
+    # Rim slice = the widest part. For a cup that's the top; for a cone narrowing
+    # upward it's the base. Fit a circle there to get the axis center + max radius.
+    rim_mask = h >= (height_m - float(cfg.model_rim_band_m))
+    rim_fp = footprint[rim_mask]
+    rim_fit = _fit_circle_2d(rim_fp) if rim_fp.shape[0] >= int(cfg.model_min_circle_points) else None
+    if rim_fit is not None and 0.0 < rim_fit[2] <= float(cfg.model_max_radius_m):
+        cu, cv, _r = rim_fit
+    else:
+        # Fall back: try a full-footprint circle fit, else weighted centroid.
+        full_fit = _fit_circle_2d(footprint) if footprint.shape[0] >= int(cfg.model_min_circle_points) else None
+        if full_fit is not None and 0.0 < full_fit[2] <= float(cfg.model_max_radius_m):
+            cu, cv = full_fit[0], full_fit[1]
+        else:
+            w = np.clip(weights, 0.0, None)
+            wsum = float(np.sum(w))
+            if wsum <= 0.0:
+                cu, cv = float(np.mean(uu)), float(np.mean(vv))
+            else:
+                cu = float(np.sum(w * uu) / wsum)
+                cv = float(np.sum(w * vv) / wsum)
+
+    center_uv = (cu, cv)
+    radius_m = _slice_radius(rim_fp if rim_fp.shape[0] else footprint, center_uv,
+                             int(cfg.model_min_circle_points), float(cfg.model_max_radius_m))
+    if radius_m is None:
+        radius_m = _slice_radius(footprint, center_uv,
+                                 int(cfg.model_min_circle_points), float(cfg.model_max_radius_m))
+
+    base_mask = h <= float(cfg.model_base_band_m)
+    base_fp = footprint[base_mask]
+    base_radius_m = _slice_radius(base_fp, center_uv,
+                                  int(cfg.model_min_circle_points), float(cfg.model_max_radius_m))
+
+    if radius_m is None:
+        return None
+    axis_center_world = origin + cu * u + cv * v
+    return axis_center_world, float(radius_m), (float(base_radius_m) if base_radius_m is not None else float(radius_m))
 
 
 def _ring_table_z_fallback(
@@ -217,6 +348,8 @@ def localize_objects_rgbd(
         position = (float(center_x), float(center_y), float(center_z))
 
         height_m: Optional[float] = None
+        radius_m: Optional[float] = None
+        base_radius_m: Optional[float] = None
         if plane_normal is not None and plane_origin is not None:
             # With a known table plane, signed distance to plane IS height above table.
             # The cup base sits on the table at signed_dist ~= 0; mask erosion may bias
@@ -224,6 +357,20 @@ def localize_objects_rgbd(
             signed = (pts - plane_origin) @ plane_normal
             top = _weighted_percentile(signed, w_per_pt, cfg.object_top_percentile)
             height_m = float(max(0.0, top))
+            # Fit an upright solid: de-biased axis center (circle fit beats a
+            # camera-half centroid) + max (rim) radius + base radius.
+            model = _fit_object_model(
+                pts, w_per_pt, plane_normal, plane_origin, height_m, cfg
+            )
+            if model is not None:
+                axis_center_world, radius_m, base_radius_m = model
+                # Replace XY with the de-biased axis; keep centroid Z for display
+                # (downstream grasp planning re-projects onto the table plane).
+                position = (
+                    float(axis_center_world[0]),
+                    float(axis_center_world[1]),
+                    float(center_z),
+                )
         else:
             table_z = _ring_table_z_fallback(
                 mask_depth=mask_depth,
@@ -266,6 +413,8 @@ def localize_objects_rgbd(
                 quality=quality,
                 covariance_diag=(0.01, 0.01, 0.02),
                 height_m=height_m,
+                radius_m=radius_m,
+                base_radius_m=base_radius_m,
                 source_mode="world" if in_world else "camera",
             )
         )

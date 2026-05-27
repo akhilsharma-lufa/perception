@@ -55,6 +55,10 @@ class CupPose:
     yaw_hint_rad: Optional[float]
     label: str
     track_id: str
+    # Object geometry model (see ObjectPoseOutput): max/rim radius (collision
+    # bound) and base-slice radius, in meters. None when no model was fit.
+    radius_m: Optional[float] = None
+    base_radius_m: Optional[float] = None
 
 
 class CupLocator(AbstractContextManager["CupLocator"]):
@@ -249,6 +253,8 @@ class CupLocator(AbstractContextManager["CupLocator"]):
             yaw_hint_rad=obj.gripper_yaw_hint_rad,
             label=obj.label,
             track_id=obj.object_id,
+            radius_m=obj.radius_m,
+            base_radius_m=obj.base_radius_m,
         )
 
     def recalibrate(self, **touch_cal_kwargs) -> None:

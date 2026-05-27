@@ -597,15 +597,54 @@ Run everything from the repo root in the `vision` conda env (`conda activate vis
    python3 -m perception.demos.pick_place_cup --port /dev/ttyUSB0 \
        --use-ik --ik-orient Z \
        --min-confidence 0.15 --grasp-close-value 40 \
-       --xy-bias-mm 11 7 --hover-mm 30 \
+       --hover-mm 30 \
        --place-mm 0 0 0          # 0 0 0 = board origin; use 100 70 0 if origin is out of reach
    ```
+   No `--xy-bias-mm` needed — perception now returns a **de-biased object axis**
+   (circle-fit on the table-plane footprint) instead of the camera-half centroid.
    If YOLO mislabels the shooter, add `--classes '*' --target-label <whatever it calls it>`.
+   The grasp planner inspects the object's diameter vs the gripper and **auto-selects
+   top-down or angled** (see below).
 
 Run step 6 several times to confirm repeatability. Falling back to the firmware
 solver is always one flag away — just drop `--use-ik`. The run **ends with a
 verified `safe_home`** (joint-angle-checked, gripper opened), printing
 `home OK`/`home FAILED`.
+
+### General object model + angled grasp (the wide-rim shot cup)
+
+Perception models each detected object as an upright solid on the table plane —
+**de-biased axis center + max (rim) radius + base radius + height** — fit by a
+circle fit to the footprint (recovers the true center from the camera-facing half;
+see `grasp_selftest.py`). No per-class dimensions are hardcoded. The grasp planner
+(`perception/control/grasp_planner.py`) turns that into a grasp:
+
+- It finds the **highest still-graspable slice** where the object diameter ≤ usable
+  gripper opening (`--gripper-max-gap-mm` − `--grip-clearance-mm`).
+- If the **widest** part already fits → **top-down** vertical grasp.
+- If not (the shot cup: rim Ø 50 mm > 45 mm max opening) → **angled** approach on the
+  lower body, tilted `--approach-tilt-deg` (default 45°) from vertical, coming from
+  the **robot-base side**, with the servo bump rolled **up**. The tool-collision
+  guard (`MotionSettings.tool_collision_boxes`) is enabled for the angled segment and
+  **rejects any move that would put the gripper body/servo bump below the table**.
+- If nothing fits → aborts with `GraspInfeasible` (no finger strike).
+
+Relevant flags: `--gripper-min-gap-mm` (20), `--gripper-max-gap-mm` (45),
+`--grip-clearance-mm` (6), `--approach-tilt-deg` (45), `--standoff-mm` (60),
+`--force-top-down` (override the planner).
+
+**Hardware-tuning checkpoints (validate on the Jetson, start with high `--standoff-mm`
+and slow `--speed`):**
+- `MotionSettings.tool_collision_boxes` are from the photos (~110×90×60 mm body +
+  servo dome on +Y, off-center). **Measure your gripper and correct them** before
+  trusting the angled path — they are the only thing standing between the servo bump
+  and the table.
+- The angled grasp commands a full orientation (approach axis + bump-up roll). With
+  `--ik-orient Z` the IK pins only the approach axis; if the executed roll drifts,
+  the collision check (run on the commanded pose) won't match reality — verify the
+  bump stays up on the first slow runs, and consider `--ik-orient all` for the grasp
+  if needed.
+- Re-run `python3 -m perception.demos.grasp_selftest` after changing any numbers.
 
 7. **Homing & recovery (when the arm gets stuck, or to reset between runs).**
    ```

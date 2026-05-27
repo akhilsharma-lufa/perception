@@ -12,6 +12,15 @@ class ObjectPoseOutput:
     quality: float
     covariance_diag: Tuple[float, float, float]
     height_m: Optional[float] = None
+    # Upright (optionally tapered) solid model on the table plane, when a table
+    # plane is available. `radius_m` is the maximum horizontal radius from the
+    # object axis (the rim of a cup — the collision bound); `base_radius_m` is the
+    # radius of a low slice near the table. Together they give a linear-cone
+    # approximation of radius vs height (equal => cylinder). When a model was fit,
+    # `position_world_xyz_m` XY is the de-biased object axis center (not the
+    # visible-surface centroid). None when no plane / too few points to fit.
+    radius_m: Optional[float] = None
+    base_radius_m: Optional[float] = None
     source_mode: str = "world"
 
 

@@ -29,7 +29,11 @@ class _Track:
     height_m: Optional[float]
     yaw_rad: Optional[float]
     quality: float
+    radius_m: Optional[float] = None
+    base_radius_m: Optional[float] = None
     height_history: Deque[float] = field(default_factory=deque)
+    radius_history: Deque[float] = field(default_factory=deque)
+    base_radius_history: Deque[float] = field(default_factory=deque)
     missed: int = 0
     matched_this_frame: bool = False
 
@@ -119,7 +123,17 @@ class WorldTracker:
                     height_m=obj.height_m,
                     yaw_rad=obj.gripper_yaw_hint_rad,
                     quality=float(obj.quality),
+                    radius_m=obj.radius_m,
+                    base_radius_m=obj.base_radius_m,
                     height_history=history,
+                    radius_history=deque(
+                        [float(obj.radius_m)] if obj.radius_m is not None else [],
+                        maxlen=window,
+                    ),
+                    base_radius_history=deque(
+                        [float(obj.base_radius_m)] if obj.base_radius_m is not None else [],
+                        maxlen=window,
+                    ),
                 )
                 self._tracks[self._next_id] = track
                 self._next_id += 1
@@ -165,6 +179,20 @@ class WorldTracker:
                     (1.0 - s.height_alpha) * track.height_m + s.height_alpha * float(obj.height_m)
                 )
 
+        window = max(1, int(s.height_median_window))
+        for value, hist_attr, val_attr in (
+            (obj.radius_m, "radius_history", "radius_m"),
+            (obj.base_radius_m, "base_radius_history", "base_radius_m"),
+        ):
+            if value is None:
+                continue
+            hist: Deque[float] = getattr(track, hist_attr)
+            if hist.maxlen != window:
+                hist = deque(hist, maxlen=window)
+                setattr(track, hist_attr, hist)
+            hist.append(float(value))
+            setattr(track, val_attr, float(np.median(np.asarray(hist, dtype=np.float64))))
+
         if obj.gripper_yaw_hint_rad is not None:
             if track.yaw_rad is None:
                 track.yaw_rad = float(obj.gripper_yaw_hint_rad)
@@ -188,5 +216,7 @@ class WorldTracker:
             quality=float(track.quality),
             covariance_diag=template.covariance_diag,
             height_m=track.height_m,
+            radius_m=track.radius_m,
+            base_radius_m=track.base_radius_m,
             source_mode=template.source_mode,
         )
