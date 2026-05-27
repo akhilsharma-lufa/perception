@@ -106,9 +106,13 @@ class MotionSettings:
     # Each entry is (center_xyz, half_extents_xyz). Defaults from the AG photos
     # (~110x90x60 mm body + a servo dome protruding ~+Y, slightly off-center in X);
     # MEASURE and tune on hardware before trusting an angled grasp.
+    # Measured on this rig: body 55 mm wide (X) x 25 mm thick (Y); servo bump
+    # protrudes 20 mm beyond the body on +Y; tool length 120 mm (Z, fingertips).
+    # Fingers are NOT modelled — they are the working end and are meant to reach
+    # the object near the table. These guard the body + servo bump only.
     tool_collision_boxes: tuple = (
-        ((0.0, 0.0, 0.055), (0.045, 0.030, 0.055)),     # gripper body
-        ((0.008, 0.045, 0.028), (0.024, 0.024, 0.032)),  # servo bump (+Y, off-center)
+        ((0.0, 0.0, 0.040), (0.0275, 0.0125, 0.045)),   # gripper body (centred on flange)
+        ((0.0, 0.0225, 0.035), (0.020, 0.010, 0.035)),  # servo bump: +12.5..+32.5 mm in +Y
     )
     # Minimum clearance (m) every collision-box corner must keep above the table.
     table_clearance_m: float = 0.005
