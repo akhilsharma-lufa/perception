@@ -293,7 +293,7 @@ def cmd_compare(args) -> int:
     jm.t_base_robotcoord = res.t_robot_world
     print(f"\nfitted t_base_robotcoord (base -> get_coords frame), "
           f"RMSE = {res.rmse_m*1000:.2f} mm over {len(base_pts)} samples")
-    print(np.array_str(res.t_base_robotcoord, precision=4, suppress_small=True))
+    print(np.array_str(jm.t_base_robotcoord, precision=4, suppress_small=True))
     print(f"per-sample residual mm: {np.round(res.per_point_residual_m*1000,2).tolist()}")
     if res.rmse_m * 1000 > 8.0:
         print("WARN: RMSE > 8 mm. The identity pymycobot<->URDF sign/offset map "
