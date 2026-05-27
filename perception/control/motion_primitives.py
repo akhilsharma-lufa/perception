@@ -81,9 +81,12 @@ class MotionSettings:
     #   world X compared to where the calibration thinks it is. With
     #   robot X ≈ -world X (from the data) and R for RPY=(180,0,0) being
     #   diag(1, -1, -1), the gripper offset in tool0 frame works out to
-    #   (-0.015, 0, 0.125) — negative X in tool0. With this set, commanding
-    #   world W lands the centerline at world W exactly.
-    tip_offset_tool0_xy_m: tuple[float, float] = (-0.015, 0.0)
+    #   (-0.015, 0, 0.125) — negative X in tool0.
+    #   Y term: with the current gripper mount, commanding the (5,4) corner
+    #   (world 132,110) landed the finger midpoint ~22 mm toward smaller world Y
+    #   (at the (5,3) corner). For this RPY/calibration a +world-Y correction maps
+    #   to +tool0 Y, so off_y = +0.022. Re-verify with a centerline touch test.
+    tip_offset_tool0_xy_m: tuple[float, float] = (-0.015, 0.022)
     # When True, compute IK ourselves (perception.control.ik_solver) and command
     # send_angles instead of send_coords. This bypasses the firmware's unreliable
     # Cartesian solver (silent rejections, arbitrary elbow/wrist branches) and is
