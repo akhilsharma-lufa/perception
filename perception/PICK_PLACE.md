@@ -524,20 +524,58 @@ won't line up with the real robot and `--use-ik` should not be trusted.
 
 Run everything from the repo root in the `vision` conda env (`conda activate vision`).
 
-1. **Calibrate (only if the camera/board/robot moved).** Use the thin pointer with
-   the gripper **removed**; touch known ChArUco corners and fit `T_robot_world`
-   (see `CALIBRATION.md`). Saves to `calibration/profiles/session_multitag.json`.
+1. **Calibration — what the camera move does and doesn't break.**
+   - **A camera move alone does NOT invalidate `T_robot_world`.** That transform
+     ties the *fiducial/world* frame to the robot; the camera pose (`t_world_camera`)
+     is recomputed live every frame from the visible board (`rgbd_localizer.py`). As
+     long as (a) the board hasn't moved relative to the robot base and (b) the board
+     is fully in the new view, `T_robot_world` is still valid. Likewise the
+     `joint_map.json` from `ik_debug compare` is **tool- and camera-independent** —
+     `compare` only reads `get_angles`/`get_coords`, so running it without the
+     gripper or camera was correct; no redo.
+   - **What the camera move *does* require:** re-confirm the board detects well from
+     the new angle (corners ≈ 70, reproj < 1 px via `yolo_world_monitor`/`debug_charuco`),
+     and **re-tune `--xy-bias-mm`** — YOLO's centroid bias depends on the camera
+     viewpoint (it masks the camera-facing half of the cup).
+   - **Profile prerequisite (verify this).** The pick pipeline needs a profile with a
+     `robot_world_transform`, produced by `touch_calibrate.py` (charuco, v3). The
+     repo's committed `session_multitag.json` is an older **v2 multitag** profile with
+     **no `robot_world_transform`** — confirm the Jetson's active profile actually has
+     one (`python3 -c "from perception.calibration.profiles import CalibrationProfileIO as P; print(P.load('calibration/profiles/session_multitag.json').get_robot_world_transform())"`).
+     If it prints `None` (or the board moved relative to the robot), **recalibrate:**
+     run `touch_calibrate.py` with the gripper **removed** and the plastic pointer in
+     the flange center hole (`--tip-offset-mm` = measured pointer protrusion); touch
+     `TL/TR/BL/BR` + a couple of inner `col,row` corners, `fit` (want RMSE < 5 mm),
+     `save`. Full flag table + corner math are in `CALIBRATION.md`.
 
-2. **Attach the parallel adaptive gripper.** Re-verify the tool length
-   (`MotionSettings.tip_offset_z_m`, currently 0.111 m) with `goto_world.py`; the
-   gripper's servo bump means **top-down only** (`--rpy 180 0 0`).
+2. **Attach the parallel adaptive gripper + measure its tip offset.**
+   - **Mounting orientation.** At home `[0,0,0,0,0,0]` the arm is up and the flange
+     face is horizontal; in the top-down grasp the demos use (`--rpy 180 0 0`) the
+     flange points straight down. **Clock the AG on the flange so the servo "bump"
+     ends up on top / horizontal in that top-down pose — never pointing down.** The
+     controller has no model of the servo's lateral protrusion; a servo-down
+     orientation once dragged the bump across the ArUco sheet (see "side-approach
+     experiment" above). **Top-down (`--rpy 180 0 0`) is the only shipped orientation.**
+   - **Measure `tip_offset_z_m` (the gripper is the only thing the calibration didn't
+     account for).** Run `goto_world --world-mm 0 0 0 --hover-mm 200 --rpy 180 0 0`,
+     measure the board→fingertip gap, and set
+     `tip_offset_z_m = flange_height − gap` (add ~7 mm upward safety margin). Set the
+     single authoritative value in `MotionSettings.tip_offset_z_m`
+     (`motion_primitives.py`). Note: the `0.111` there, the `0.125` in the session
+     log, and `GripperSettings.tip_offset_z_m = 0.095` are stale/conflicting —
+     `MotionSettings.tip_offset_z_m` is the one motion actually uses; the
+     `GripperSettings` copy is unused. Re-measure and trust one number.
+   - **Verify the centerline** `tip_offset_tool0_xy_m`: command a known corner, sight
+     straight down between the closed fingers, and adjust the tool0-frame XY offset
+     (currently `(-0.015, 0.0)`) until the finger midpoint lands on the mark.
 
-3. **Lock the joint map (once per setup):**
-   ```
-   python3 -m perception.demos.ik_debug compare --port /dev/ttyUSB0 --samples 12 --save
-   ```
-   Expect RMSE within a few mm. If RMSE > 8 mm, inspect per-sample residuals before
-   trusting IK (a per-joint sign flip may be needed — see the WARN it prints).
+3. **Joint map — already locked, no redo needed.** You ran
+   `ik_debug compare --samples 12 --save` → 0.96 mm RMSE, writing
+   `calibration/profiles/joint_map.json`. It's tool- and camera-independent (it only
+   fits `get_angles`↔URDF), so attaching the gripper or moving the camera doesn't
+   affect it. Only re-run `compare` if you recalibrate the robot's joint zeros. (If
+   RMSE were > 8 mm, inspect per-sample residuals before trusting IK — a per-joint
+   sign flip may be needed; see the WARN it prints.)
 
 4. **Sanity-check a single move (no detection):**
    ```
@@ -565,7 +603,23 @@ Run everything from the repo root in the `vision` conda env (`conda activate vis
    If YOLO mislabels the shooter, add `--classes '*' --target-label <whatever it calls it>`.
 
 Run step 6 several times to confirm repeatability. Falling back to the firmware
-solver is always one flag away — just drop `--use-ik`.
+solver is always one flag away — just drop `--use-ik`. The run **ends with a
+verified `safe_home`** (joint-angle-checked, gripper opened), printing
+`home OK`/`home FAILED`.
+
+7. **Homing & recovery (when the arm gets stuck, or to reset between runs).**
+   ```
+   python3 -m perception.demos.go_home --port /dev/ttyUSB0          # arm + gripper
+   python3 -m perception.demos.go_home --port /dev/ttyUSB0 --no-gripper   # gripper not on yet
+   ```
+   Parks the arm at `[0,0,0,0,0,0]` (arm up, gripper perpendicular) and opens the
+   gripper, **from any pose**: it re-energises the servos first (in case a prior run
+   left them limp), drops whatever is held, then verifies arrival by joint angle —
+   not the firmware's unreliable `is_moving()`. Prints `HOME OK` (exit 0) or
+   `HOME FAILED` (exit 1, joints listed). Leaves servos engaged. The same logic
+   (`perception.control.safe_home`) now backs the end-of-run home in
+   `pick_place_cup`, `goto_cup`, and `goto_world`, so every entry point homes the
+   same verified way. Tune with `--speed`, `--timeout-s`, `--tol-deg`.
 
 ### Next reliability lever (not yet built)
 

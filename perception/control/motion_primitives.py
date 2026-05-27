@@ -14,6 +14,7 @@ Build order matches the plan:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -345,3 +346,72 @@ def home(
     if gripper is not None:
         gripper.open(wait=False)
     driver.home(speed=speed)
+
+
+def safe_home(
+    driver: MyCobotDriver,
+    gripper: Optional[Gripper] = None,
+    *,
+    speed: int = 30,
+    timeout_s: float = 15.0,
+    tol_deg: float = 3.0,
+    open_gripper: bool = True,
+) -> bool:
+    """Reliably park the arm at [0,0,0,0,0,0] and open the gripper.
+
+    Recovery-grade homing: works from any pose (including a stuck/awkward one),
+    re-energises the servos first in case a prior run released them, drops
+    whatever is held, then verifies arrival **by joint angle** rather than the
+    firmware's ``is_moving()`` flag (which on this 280 firmware reports 0 before
+    the motion even starts — see PICK_PLACE.md "Home reliability").
+
+    Returns True if all six joints reach 0 within ``tol_deg`` before
+    ``timeout_s``, else False. Never raises for a non-arrival; it logs the final
+    angles and returns the boolean so the caller/CLI decides what to do. Leaves
+    the servos engaged.
+    """
+    HOME = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    # 1. Re-energise — the arm may be limp (released) or stuck mid-fault.
+    try:
+        driver.power_on()
+        time.sleep(0.5)
+    except Exception as exc:
+        print(f"[safe_home] WARN: power_on failed: {exc}")
+
+    # 2. Drop whatever is held before the arm sweeps home.
+    if gripper is not None and open_gripper:
+        try:
+            gripper.open(wait=True)
+        except Exception as exc:
+            print(f"[safe_home] WARN: gripper open failed: {exc}")
+
+    # 3. Diagnostics: where are we starting from?
+    try:
+        start = driver.get_angles_deg(retries=3)
+        print(f"[safe_home] from angles: {[round(a, 1) for a in start]}")
+    except Exception:
+        print("[safe_home] could not read starting angles")
+
+    # 4. Command home (joint space — deterministic).
+    driver.send_angles_deg(HOME, speed=int(speed))
+
+    # 5. Verify by joint angle, polling until converged or timed out.
+    deadline = time.monotonic() + float(timeout_s)
+    last: Optional[Sequence[float]] = None
+    while time.monotonic() < deadline:
+        try:
+            last = driver.get_angles_deg(retries=2)
+        except Exception:
+            time.sleep(0.15)
+            continue
+        if max(abs(float(last[i])) for i in range(6)) <= float(tol_deg):
+            print(f"[safe_home] HOME OK: {[round(float(a), 1) for a in last]}")
+            return True
+        time.sleep(0.15)
+
+    print(
+        f"[safe_home] HOME FAILED: joints still off after {timeout_s:.0f}s: "
+        f"{[round(float(a), 1) for a in last] if last is not None else 'unknown'}"
+    )
+    return False

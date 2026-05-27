@@ -46,6 +46,7 @@ from perception.control import (
     is_reachable,
     move_to_world,
     project_above_table,
+    safe_home,
     world_to_robot,
 )
 
@@ -325,7 +326,8 @@ def main() -> None:
         import time as _t
         _t.sleep(2.0)
         if not args.no_home_after:
-            driver.home(speed=int(args.speed))
+            # No gripper in this tool (pointer/tip-offset use); home arm only.
+            safe_home(driver, gripper=None, speed=int(args.speed), open_gripper=False)
     finally:
         if args.release_servos:
             print("[goto_world] releasing all servos (arm will drop).")

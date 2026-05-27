@@ -11,6 +11,7 @@ from .motion_primitives import (
     place,
     pre_grasp,
     project_above_table,
+    safe_home,
     world_to_robot,
 )
 from .mycobot_driver import MyCobotDriver, MyCobotDriverSettings, RobotMotionError
@@ -32,5 +33,6 @@ __all__ = [
     "place",
     "pre_grasp",
     "project_above_table",
+    "safe_home",
     "world_to_robot",
 ]

@@ -48,11 +48,11 @@ from perception.control import (
     MyCobotDriverSettings,
     ReachabilityError,
     descend_and_grasp,
-    home,
     is_reachable,
     lift,
     place,
     pre_grasp,
+    safe_home,
 )
 from perception.detection import YoloDetectorSettings, YoloObjectDetector
 from perception.geometry.transforms import invert_transform
@@ -463,23 +463,14 @@ def main() -> None:
             _log_gripper("back-off")
 
             print("[pick_place] (6/6) home ...")
-            # driver.home()'s wait_until_done can return early on this firmware
-            # (is_moving() reports 0 before the motion actually begins). Force
-            # a settle: pause to make sure any residual motion is done, then
-            # send home, then sleep long enough for the joints to complete the
-            # swing at the configured speed, then verify pose.
+            # safe_home verifies arrival by joint angle (the firmware's
+            # is_moving() reports 0 before the motion begins), opens the
+            # gripper, and re-energises servos first. Returns True/False.
             time.sleep(1.5)  # let any residual back-off motion finish first
-            home(driver, gripper, speed=int(args.speed))
-            time.sleep(5.0)
-            try:
-                angles = driver.get_angles_deg(retries=4)
-                print(f"[pick_place]   angles AFTER home: "
-                      f"{[round(a, 1) for a in angles]}")
-            except Exception as exc:
-                print(f"[pick_place]   angles AFTER home: read failed: {exc}")
+            homed = safe_home(driver, gripper, speed=int(args.speed))
             _log_pose("home")
             _log_gripper("home")
-            print("[pick_place] done.")
+            print(f"[pick_place] done. (home {'OK' if homed else 'FAILED'})")
         except ReachabilityError as exc:
             print(f"[pick_place] reach error mid-sequence: {exc}")
             sys.exit(3)
