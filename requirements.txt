@@ -3,3 +3,5 @@ record3d
 opencv-contrib-python
 ultralytics
 pupil-apriltags
+ikpy            # URDF-based forward/inverse kinematics (perception.control.kinematics)
+matplotlib      # ik_debug.py plot subcommand (headless PNG)

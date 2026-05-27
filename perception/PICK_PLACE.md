@@ -481,3 +481,95 @@ python3 -m perception.demos.pick_place_cup --port /dev/ttyUSB0 \
 If you change the cup or the iPhone position, the only flag likely to
 need re-tuning is `--xy-bias-mm` — re-derive it by comparing the
 detected position to the cup's actual position once.
+
+---
+
+## Reliable trajectories: our own IK instead of firmware `send_coords`
+
+The single biggest source of *unreliable* motion was the firmware's onboard
+Cartesian solver, invoked by `send_coords`. On the 280 it silently rejects
+targets ("arm barely moved"), picks arbitrary elbow/wrist branches, and can't be
+seeded. We now compute IK ourselves from the URDF (`perception/control/kinematics.py`
++ `ik_solver.py`, using `ikpy`) and command `send_angles` (joint space), which the
+firmware servos to deterministically. Enable it with `--use-ik`.
+
+Why it's more reliable: we seed IK from the **current** joint angles (continuous,
+predictable motion), constrain only the **approach axis** (`--ik-orient Z`, correct
+for top-down grasps and accurate in position), enforce joint limits, and reject
+unreachable targets up front instead of getting a silent no-op. Offline validation
+(`ik_debug.py roundtrip`, near-seed + Z mode): median 0.0 mm, p90 ~0.4 mm position
+error, approach axis exact.
+
+### The IK debug tool — `perception/demos/ik_debug.py`
+
+| Subcommand | Robot? | Purpose |
+|---|---|---|
+| `fk --angles j1..j6` | no | joint angles (deg) → flange pose (base + get_coords frame) |
+| `ik --xyz x y z [--rpy ..] [--orient Z]` | no | Cartesian target → joint angles + round-trip error + limit margins |
+| `roundtrip [--n N]` | no | FK→IK→FK self-consistency (near seed + Z mode by default) |
+| `plot --angles .. --save f.png` | no | 3D stick-figure (headless via Agg) |
+| `compare [--samples N] [--manual] --save` | **yes** | fit & save the pymycobot↔URDF `JointMap` |
+| `solve-and-send --xyz .. [--rpy ..] --yes` | **yes** | solve IK and move there; reports achieved error |
+
+**`compare` is the prerequisite.** It measures the mapping between pymycobot
+(`get_angles`/`get_coords`) and the URDF base frame and writes
+`calibration/profiles/joint_map.json`. The default identity map (Elephant's MoveIt
+bridge feeds URDF radians straight to `send_radians`) is the starting point; `compare`
+fits the rigid `t_base_robotcoord` transform and reports RMSE. Without it, our FK
+won't line up with the real robot and `--use-ik` should not be trusted.
+
+---
+
+## End-to-end runbook (Jetson over SSH)
+
+Run everything from the repo root in the `vision` conda env (`conda activate vision`).
+
+1. **Calibrate (only if the camera/board/robot moved).** Use the thin pointer with
+   the gripper **removed**; touch known ChArUco corners and fit `T_robot_world`
+   (see `CALIBRATION.md`). Saves to `calibration/profiles/session_multitag.json`.
+
+2. **Attach the parallel adaptive gripper.** Re-verify the tool length
+   (`MotionSettings.tip_offset_z_m`, currently 0.111 m) with `goto_world.py`; the
+   gripper's servo bump means **top-down only** (`--rpy 180 0 0`).
+
+3. **Lock the joint map (once per setup):**
+   ```
+   python3 -m perception.demos.ik_debug compare --port /dev/ttyUSB0 --samples 12 --save
+   ```
+   Expect RMSE within a few mm. If RMSE > 8 mm, inspect per-sample residuals before
+   trusting IK (a per-joint sign flip may be needed — see the WARN it prints).
+
+4. **Sanity-check a single move (no detection):**
+   ```
+   python3 -m perception.demos.ik_debug solve-and-send --port /dev/ttyUSB0 \
+       --xyz 180 -65 250 --rpy 180 0 0 --yes
+   ```
+   Compare against the same point via `goto_world.py` to confirm the IK path lands
+   where `send_coords` does.
+
+5. **Detection dry-run (no motion):**
+   ```
+   python3 -m perception.demos.pick_place_cup --port /dev/ttyUSB0 --dry-run \
+       --min-confidence 0.15
+   ```
+   Confirms the red shooter cup is detected and the pick/place targets are in reach.
+
+6. **Live pick → place at origin (IK path):**
+   ```
+   python3 -m perception.demos.pick_place_cup --port /dev/ttyUSB0 \
+       --use-ik --ik-orient Z \
+       --min-confidence 0.15 --grasp-close-value 40 \
+       --xy-bias-mm 11 7 --hover-mm 30 \
+       --place-mm 0 0 0          # 0 0 0 = board origin; use 100 70 0 if origin is out of reach
+   ```
+   If YOLO mislabels the shooter, add `--classes '*' --target-label <whatever it calls it>`.
+
+Run step 6 several times to confirm repeatability. Falling back to the firmware
+solver is always one flag away — just drop `--use-ik`.
+
+### Next reliability lever (not yet built)
+
+The eye-in-hand wrist camera (`camera_flange` URDF variant) enables closed-loop
+visual servoing on the final ~3 cm — the best way to beat the 280's ±10 mm
+repeatability and any residual calibration drift. Recommended follow-on after the
+IK path is validated on hardware.

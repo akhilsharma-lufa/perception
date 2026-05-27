@@ -78,6 +78,18 @@ class MotionSettings:
     #   (-0.015, 0, 0.125) — negative X in tool0. With this set, commanding
     #   world W lands the centerline at world W exactly.
     tip_offset_tool0_xy_m: tuple[float, float] = (-0.015, 0.0)
+    # When True, compute IK ourselves (perception.control.ik_solver) and command
+    # send_angles instead of send_coords. This bypasses the firmware's unreliable
+    # Cartesian solver (silent rejections, arbitrary elbow/wrist branches) and is
+    # the path to repeatable motion. Requires a fitted JointMap
+    # (ik_debug.py compare -> calibration/profiles/joint_map.json). Default False
+    # preserves the legacy send_coords behaviour until validated on hardware.
+    use_ik_solver: bool = False
+    # Orientation constraint for the IK path: "Z" pins the approach axis (correct
+    # for top-down grasps, accurate positioning), "all" matches full orientation,
+    # "none" is position-only. See ik_solver / kinematics.ik.
+    ik_orientation_mode: str = "Z"
+    ik_max_pos_err_mm: float = 3.0
 
 
 @dataclass
@@ -87,6 +99,20 @@ class MotionContext:
     table_normal_world: np.ndarray         # 3, points "up" (away from table)
     table_origin_world: np.ndarray         # 3, a point on the table plane
     settings: MotionSettings = field(default_factory=MotionSettings)
+    # Lazily-built IK solver (only when settings.use_ik_solver). Kept on the
+    # context so the chain + JointMap load once and are reused across primitives.
+    ik_solver: object = None
+
+    def get_ik_solver(self):
+        """Return the IKSolver, building it on first use. Import is lazy so the
+        ikpy dependency is only required when the IK path is enabled."""
+        if self.ik_solver is None:
+            from .ik_solver import IKSolver
+            self.ik_solver = IKSolver(
+                orientation_mode=self.settings.ik_orientation_mode,
+                max_pos_err_mm=self.settings.ik_max_pos_err_mm,
+            )
+        return self.ik_solver
 
 
 def world_to_robot(p_world_m: Sequence[float], t_robot_world: np.ndarray) -> np.ndarray:
@@ -144,6 +170,38 @@ def is_reachable(p_world_m: Sequence[float], ctx: MotionContext) -> tuple[bool, 
     return dist <= float(ctx.settings.max_reach_m), dist
 
 
+def _command_flange(
+    driver: MyCobotDriver,
+    p_robot_flange_m: np.ndarray,
+    rpy_deg: tuple[float, float, float],
+    ctx: MotionContext,
+    speed: Optional[int],
+    wait: bool,
+) -> None:
+    """Send the arm to a flange pose, via our IK + send_angles when
+    `settings.use_ik_solver`, else via the legacy send_coords path."""
+    s = int(speed if speed is not None else ctx.settings.default_speed)
+    if ctx.settings.use_ik_solver:
+        solver = ctx.get_ik_solver()
+        try:
+            seed = driver.get_angles_deg(retries=3)
+        except Exception:
+            seed = None
+        angles_deg, _err = solver.solve_flange(p_robot_flange_m, rpy_deg, seed_angles_deg=seed)
+        driver.send_angles_deg(angles_deg, speed=s)
+    else:
+        driver.send_coords_mm_deg(
+            _coords_mm_deg(p_robot_flange_m, rpy_deg),
+            speed=s, mode=int(ctx.settings.coord_mode),
+        )
+    if wait:
+        try:
+            driver.wait_until_done(strict=False)
+        except Exception:
+            # Driver's wait already has a stable-pose fallback; ignore residual issues.
+            pass
+
+
 def _coords_mm_deg(
     p_robot_m: np.ndarray,
     rpy_deg: tuple[float, float, float],
@@ -195,15 +253,7 @@ def move_to_world(
         dtype=np.float64,
     )
     p_robot_flange = p_robot_tip - r_robot_tool0 @ tip_offset_tool0
-    coords = _coords_mm_deg(p_robot_flange, rpy)
-    s = int(speed if speed is not None else ctx.settings.default_speed)
-    driver.send_coords_mm_deg(coords, speed=s, mode=int(ctx.settings.coord_mode))
-    if wait:
-        try:
-            driver.wait_until_done(strict=False)
-        except Exception:
-            # Driver's wait already has a stable-pose fallback; ignore residual issues.
-            pass
+    _command_flange(driver, p_robot_flange, rpy, ctx, speed=speed, wait=wait)
 
 
 # ----- Composed primitives -----------------------------------------------------
@@ -258,17 +308,10 @@ def lift(
     n_robot = ctx.t_robot_world[:3, :3] @ n_world  # direction-only (no translation)
     h = float(lift_m if lift_m is not None else ctx.settings.lift_height_m)
     new_xyz_mm = np.array(coords[:3], dtype=np.float64) + n_robot * (h * 1000.0)
-    rpy = coords[3:6]
-    s = int(speed if speed is not None else ctx.settings.default_speed)
-    driver.send_coords_mm_deg(
-        [float(new_xyz_mm[0]), float(new_xyz_mm[1]), float(new_xyz_mm[2]),
-         float(rpy[0]), float(rpy[1]), float(rpy[2])],
-        speed=s, mode=int(ctx.settings.coord_mode),
-    )
-    try:
-        driver.wait_until_done(strict=False)
-    except Exception:
-        pass
+    rpy = (float(coords[3]), float(coords[4]), float(coords[5]))
+    # coords/new_xyz_mm are the flange pose in the robot frame already (lift is a
+    # relative move read back from get_coords), so command it directly.
+    _command_flange(driver, new_xyz_mm * 1e-3, rpy, ctx, speed=speed, wait=True)
 
 
 def place(

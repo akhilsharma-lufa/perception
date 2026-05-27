@@ -92,6 +92,15 @@ def main() -> None:
     )
     p.add_argument("--max-reach-mm", type=float, default=270.0)
     p.add_argument(
+        "--use-ik", action="store_true",
+        help="Use URDF-based IK + send_angles instead of firmware send_coords "
+             "(requires a fitted JointMap: ik_debug.py compare --save).",
+    )
+    p.add_argument(
+        "--ik-orient", choices=("none", "Z", "all"), default="Z",
+        help="IK orientation constraint (default Z = approach axis).",
+    )
+    p.add_argument(
         "--no-home-after",
         action="store_true",
         help="Skip the return-to-home at the end.",
@@ -156,6 +165,8 @@ def main() -> None:
         max_reach_m=float(args.max_reach_mm) * 1e-3,
         default_speed=int(args.speed),
         vertical_rpy_deg=rpy_override,
+        use_ik_solver=bool(args.use_ik),
+        ik_orientation_mode=str(args.ik_orient),
     )
     ctx = MotionContext(
         t_robot_world=t_robot_world,

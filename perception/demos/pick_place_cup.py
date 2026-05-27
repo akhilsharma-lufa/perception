@@ -218,8 +218,20 @@ def main() -> None:
         help="How long to observe the scene before picking."
     )
     parser.add_argument(
-        "--min-confidence", type=float, default=0.5,
-        help="Ignore detections below this confidence."
+        "--min-confidence", type=float, default=0.15,
+        help="Ignore detections below this confidence. Lenient default (0.15) "
+             "for the red plastic shooter cup, which YOLO scores low. If it gets "
+             "mislabelled (not 'cup'), also pass --classes '*' --target-label <label>."
+    )
+    parser.add_argument(
+        "--use-ik", action="store_true",
+        help="Use our URDF-based IK + send_angles instead of the firmware's "
+             "send_coords Cartesian solver. More reliable; requires a fitted "
+             "JointMap (run: ik_debug.py compare --save). See PICK_PLACE.md runbook."
+    )
+    parser.add_argument(
+        "--ik-orient", choices=("none", "Z", "all"), default="Z",
+        help="IK orientation constraint (default Z = approach axis; for top-down grasps)."
     )
     parser.add_argument(
         "--xy-bias-mm", type=float, nargs=2, default=[0.0, 0.0],
@@ -278,6 +290,8 @@ def main() -> None:
         hover_height_m=float(args.hover_mm) * 1e-3,
         release_clearance_m=float(args.release_mm) * 1e-3,
         grasp_close_value=int(args.grasp_close_value),
+        use_ik_solver=bool(args.use_ik),
+        ik_orientation_mode=str(args.ik_orient),
     )
     ctx = MotionContext(
         t_robot_world=t_robot_world,
