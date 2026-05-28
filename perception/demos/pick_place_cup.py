@@ -587,6 +587,28 @@ def main() -> None:
             time.sleep(0.3)
             _log_gripper("force-open")
 
+            # Pre-pose to a shoulder-forward / elbow-down config so the IK solver
+            # seeds from a good starting pose (seeding from home [0,0,0,0,0,0] can
+            # drop ikpy into a 30-40 mm local minimum for tilted angled poses).
+            # Mirrors goto_world / goto_cup.
+            prepose = [0.0, -30.0, -30.0, 0.0, 0.0, -45.0]
+            try:
+                print(f"[pick_place] pre-posing to {prepose} ...")
+                driver.send_angles_deg(prepose, speed=40)
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline:
+                    try:
+                        cur = driver.get_angles_deg(retries=2)
+                    except Exception:
+                        time.sleep(0.1)
+                        continue
+                    if max(abs(cur[i] - prepose[i]) for i in range(6)) <= 3.0:
+                        break
+                    time.sleep(0.15)
+                _log_pose("prepose")
+            except Exception as exc:
+                print(f"[pick_place] WARN: prepose failed: {exc}")
+
             if grasp_plan is not None and grasp_plan.mode == "angled":
                 print("[pick_place] (1/6) angled approach_and_grasp ...")
                 approach_and_grasp(driver, gripper, grasp_plan, ctx,
