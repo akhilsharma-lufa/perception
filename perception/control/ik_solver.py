@@ -67,17 +67,40 @@ class IKSolver:
         if orient_mode is not None:
             R_base = jm.t_base_robotcoord[:3, :3].T @ _rpy_to_R(rpy_deg)
 
-        seed_deg = (np.asarray(seed_angles_deg, dtype=np.float64)
-                    if seed_angles_deg is not None
-                    else np.array([0.0, -30.0, -30.0, 0.0, 0.0, -45.0]))
-        seed_rad = jm.pymycobot_deg_to_urdf_rad(seed_deg)
+        # Multi-seed solve: ikpy is seed-sensitive and can settle into a local
+        # minimum tens of mm off depending on where it starts. Try the provided
+        # seed (current pose, for continuity) plus a spread of fixed configs, and
+        # keep the lowest-error solution. This removes the "feasible in the probe
+        # but fails on execution" inconsistency (the probe used a different seed).
+        seeds_deg: list[np.ndarray] = []
+        if seed_angles_deg is not None:
+            seeds_deg.append(np.asarray(seed_angles_deg, dtype=np.float64).reshape(6))
+        seeds_deg.extend([
+            np.array([0.0, -30.0, -30.0, 0.0, 0.0, -45.0]),
+            np.array([0.0, -60.0, -20.0, 0.0, 40.0, -45.0]),
+            np.array([0.0, -90.0, 20.0, 0.0, 40.0, 0.0]),
+            np.array([0.0, -45.0, -45.0, 0.0, 30.0, -45.0]),
+            np.array([0.0, -20.0, -60.0, 0.0, 50.0, -45.0]),
+            np.array([0.0, -70.0, -10.0, 0.0, 30.0, -90.0]),
+        ])
 
-        sol_rad = K.ik(self.chain, p_base, target_R=R_base,
-                       seed_active6_rad=seed_rad, orientation_mode=orient_mode)
-        pos_err_mm = float(np.linalg.norm(K.fk(self.chain, sol_rad)[:3, 3] - p_base)) * 1000.0
-        if pos_err_mm > self.max_pos_err_mm:
+        best_sol = None
+        best_err = float("inf")
+        for sd in seeds_deg:
+            seed_rad = jm.pymycobot_deg_to_urdf_rad(sd)
+            sol_rad = K.ik(self.chain, p_base, target_R=R_base,
+                           seed_active6_rad=seed_rad, orientation_mode=orient_mode)
+            err = float(np.linalg.norm(K.fk(self.chain, sol_rad)[:3, 3] - p_base)) * 1000.0
+            if err < best_err:
+                best_err = err
+                best_sol = sol_rad
+            if err <= self.max_pos_err_mm:
+                break  # good enough; stop early (first seed tried is the continuous one)
+
+        if best_sol is None or best_err > self.max_pos_err_mm:
             raise IKSolveError(
-                f"IK reached only {pos_err_mm:.1f} mm from target "
-                f"(tol {self.max_pos_err_mm:.1f} mm); target likely unreachable/singular."
+                f"IK reached only {best_err:.1f} mm from target across "
+                f"{len(seeds_deg)} seeds (tol {self.max_pos_err_mm:.1f} mm); "
+                f"target likely unreachable/singular."
             )
-        return [float(a) for a in jm.urdf_rad_to_pymycobot_deg(sol_rad)], pos_err_mm
+        return [float(a) for a in jm.urdf_rad_to_pymycobot_deg(best_sol)], best_err
