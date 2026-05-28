@@ -182,6 +182,7 @@ def _observe_cup(
     min_confidence: float,
     window_s: float,
     known_dims: tuple[float, float, float] | None = None,
+    lens_calibration=None,
 ) -> CupObservation | None:
     """Run detection for `window_s` seconds; return a `CupObservation` for the best
     matching target, or None if no candidate.
@@ -204,7 +205,21 @@ def _observe_cup(
             continue
         n_frames += 1
 
-        board_det = detect_board_pose(packet.rgb, packet.intrinsic_mat, board_cfg)
+        # Lens-corrected PnP when a lens calibration is on the profile; falls
+        # back to Record3D's pinhole K when not. This is opt-in: callers that
+        # don't pass `lens_calibration` (e.g. the other team's pipeline) get
+        # exactly the historical behaviour.
+        if lens_calibration is not None:
+            k_for_pnp = lens_calibration.k_for_resolution(
+                packet.rgb.shape[1], packet.rgb.shape[0]
+            )
+            dist_for_pnp = lens_calibration.dist_array()
+        else:
+            k_for_pnp = packet.intrinsic_mat
+            dist_for_pnp = None
+        board_det = detect_board_pose(
+            packet.rgb, k_for_pnp, board_cfg, dist_coeffs=dist_for_pnp,
+        )
         if board_det is None:
             n_anchor_fail += 1
             continue
@@ -224,6 +239,7 @@ def _observe_cup(
             settings=localizer_cfg,
             table_plane=table_plane,
             known_dims=known_dims,
+            lens_calibration=lens_calibration,
         )
 
         # Pair outputs back to detections via "label_index" in object_id.
@@ -484,6 +500,7 @@ def main() -> None:
             min_confidence=float(args.min_confidence),
             window_s=float(args.detection_window_s),
             known_dims=known_dims,
+            lens_calibration=profile.lens_calibration,
         )
         if result is None:
             print(f"[pick_place] ABORT: no '{args.target_label}' detection.")

@@ -21,6 +21,48 @@ class TablePlane:
 
 
 @dataclass
+class LensCalibration:
+    """Camera-intrinsic lens model: refined K and distortion coefficients,
+    estimated by `perception.demos.calibrate_lens`.
+
+    Backward compatibility note: `CalibrationProfile.lens_calibration` is
+    optional. Downstream code (PnP, depth unprojection) treats `None` as
+    "assume pinhole / zero distortion" — i.e. the prior behaviour. So
+    existing profiles, existing callers, and existing pipelines that don't
+    know about this field continue to work unchanged.
+    """
+    k_refined: List[List[float]]            # 3x3, at image_size_wh resolution
+    dist_coeffs: List[float]                # 5: (k1, k2, p1, p2, k3)
+    image_size_wh: List[int]                # (W, H) the K is at
+    rms_reproj_px: float
+    n_captures: int
+    captured_at: str
+
+    def k_array(self) -> np.ndarray:
+        return np.asarray(self.k_refined, dtype=np.float64).reshape(3, 3)
+
+    def dist_array(self) -> np.ndarray:
+        return np.asarray(self.dist_coeffs, dtype=np.float64).reshape(-1)
+
+    def k_for_resolution(self, w: int, h: int) -> np.ndarray:
+        """Return K_refined scaled to the requested (W, H) image resolution.
+        `dist_coeffs` are dimensionless (operate on normalised image coords)
+        and remain valid at any resolution as long as K is scaled to match."""
+        k = self.k_array()
+        calib_w, calib_h = int(self.image_size_wh[0]), int(self.image_size_wh[1])
+        if (int(w), int(h)) == (calib_w, calib_h):
+            return k
+        sx = float(w) / float(calib_w)
+        sy = float(h) / float(calib_h)
+        out = np.array(k, dtype=np.float64, copy=True)
+        out[0, 0] *= sx
+        out[0, 2] *= sx
+        out[1, 1] *= sy
+        out[1, 2] *= sy
+        return out
+
+
+@dataclass
 class CharucoBoardSpec:
     """Persisted ChArUco board geometry. Mirrors charuco_board.CharucoBoardConfig
     but lives here so profiles.py has no opencv import dependency."""
@@ -44,6 +86,7 @@ class CalibrationProfile:
     table_plane: Optional[TablePlane] = None
     robot_world_transform: Optional[List[List[float]]] = None
     charuco_board: Optional[CharucoBoardSpec] = None
+    lens_calibration: Optional[LensCalibration] = None
 
     @classmethod
     def new(
@@ -104,6 +147,13 @@ class CalibrationProfile:
             mean_abs_residual_m=float(mean_abs_residual_m),
         )
 
+    def set_lens_calibration(self, lc: LensCalibration) -> None:
+        """Attach a lens calibration. Downstream code that opts in (by passing
+        `lens_calibration=` to `localize_objects_rgbd` or `dist_coeffs=` to
+        `detect_board_pose`) will use it; legacy callers keep their pinhole
+        behaviour."""
+        self.lens_calibration = lc
+
     def set_charuco_board(self, spec: CharucoBoardSpec) -> None:
         # Accept either a CharucoBoardSpec or anything dict-like / dataclass-like.
         if isinstance(spec, CharucoBoardSpec):
@@ -126,13 +176,24 @@ class CalibrationProfileIO:
     def save(profile: CalibrationProfile, path: str):
         path_obj = Path(path)
         path_obj.parent.mkdir(parents=True, exist_ok=True)
-        path_obj.write_text(json.dumps(asdict(profile), indent=2))
+        data = asdict(profile)
+        # Backward compatibility: do not emit `lens_calibration` at all when
+        # it is unset. The other team's profile loaders (which we cannot
+        # inspect) saw a fixed set of top-level keys before this field was
+        # added; profiles produced by code paths that never set lens
+        # calibration must stay byte-identical to the prior format. The new
+        # field appears in the JSON only on profiles that actively carry a
+        # lens calibration.
+        if data.get("lens_calibration") is None:
+            data.pop("lens_calibration", None)
+        path_obj.write_text(json.dumps(data, indent=2))
 
     @staticmethod
     def load(path: str) -> CalibrationProfile:
         data = json.loads(Path(path).read_text())
         table_plane_data = data.pop("table_plane", None)
         charuco_data = data.pop("charuco_board", None)
+        lens_data = data.pop("lens_calibration", None)
         # Drop unknown keys so old / forward-compatible profiles still load.
         known = {
             "schema_version", "created_at_utc", "origin_tag_id", "tag_family",
@@ -145,4 +206,14 @@ class CalibrationProfileIO:
             profile.table_plane = TablePlane(**table_plane_data)
         if charuco_data is not None:
             profile.charuco_board = CharucoBoardSpec(**charuco_data)
+        if lens_data is not None:
+            # Forward-compat: ignore unknown fields if a future calibrator adds
+            # them (e.g. higher-order distortion). Keep the loader tolerant.
+            allowed = {f for f in (
+                "k_refined", "dist_coeffs", "image_size_wh",
+                "rms_reproj_px", "n_captures", "captured_at",
+            )}
+            profile.lens_calibration = LensCalibration(
+                **{k: v for k, v in lens_data.items() if k in allowed}
+            )
         return profile

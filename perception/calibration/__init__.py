@@ -10,6 +10,7 @@ from .profiles import (
     CalibrationProfile,
     CalibrationProfileIO,
     CharucoBoardSpec,
+    LensCalibration,
     TablePlane,
 )
 from .table_plane_validator import (
@@ -24,6 +25,7 @@ __all__ = [
     "CalibrationProfile",
     "CalibrationProfileIO",
     "CharucoBoardSpec",
+    "LensCalibration",
     "TablePlane",
     "MultiTagCalibrator",
     "MultiTagCalibratorSettings",

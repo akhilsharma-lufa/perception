@@ -6,7 +6,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from perception.calibration.profiles import TablePlane
+from perception.calibration.profiles import LensCalibration, TablePlane
 from perception.detection import YoloDetection
 from perception.geometry import scale_intrinsics_for_shape
 from perception.io.frame_packet import FramePacket
@@ -81,15 +81,44 @@ def _weighted_percentile(values: np.ndarray, weights: np.ndarray, q: float) -> f
     return float(np.interp(target, cw, v_sorted))
 
 
-def _unproject_valid(depth: np.ndarray, valid: np.ndarray, k_depth: np.ndarray) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
+def _unproject_valid(
+    depth: np.ndarray,
+    valid: np.ndarray,
+    k_depth: np.ndarray,
+    dist_coeffs: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
+    """Unproject the depth pixels selected by `valid` into camera-frame 3D
+    points.
+
+    Backward compatibility: `dist_coeffs=None` (default) preserves the existing
+    pinhole behaviour byte-for-byte, so legacy callers (third-party code,
+    other demos in this repo) are unaffected. Pass a 5-vector
+    `(k1, k2, p1, p2, k3)` to enable lens-distortion-corrected unprojection
+    via `cv2.undistortPoints`. `dist_coeffs` are dimensionless and work at any
+    image resolution as long as `k_depth` is scaled to match.
+    """
     ys, xs = np.where(valid)
     if ys.size == 0:
         return np.zeros((0, 3), dtype=np.float64), (ys, xs)
     z = depth[ys, xs].astype(np.float64)
-    fx, fy = float(k_depth[0, 0]), float(k_depth[1, 1])
-    cx, cy = float(k_depth[0, 2]), float(k_depth[1, 2])
-    x = ((xs.astype(np.float64) - cx) * z) / fx
-    y = ((ys.astype(np.float64) - cy) * z) / fy
+    # Fast path: pure pinhole when distortion is unspecified or all-zero.
+    if dist_coeffs is None or not np.any(np.asarray(dist_coeffs, dtype=np.float64)):
+        fx, fy = float(k_depth[0, 0]), float(k_depth[1, 1])
+        cx, cy = float(k_depth[0, 2]), float(k_depth[1, 2])
+        x = ((xs.astype(np.float64) - cx) * z) / fx
+        y = ((ys.astype(np.float64) - cy) * z) / fy
+        return np.stack([x, y, z], axis=1), (ys, xs)
+    # Distortion-aware path: rectify pixel coords to normalised rays.
+    pix = np.stack(
+        [xs.astype(np.float64), ys.astype(np.float64)], axis=1
+    ).reshape(-1, 1, 2)
+    norm = cv2.undistortPoints(
+        pix,
+        np.asarray(k_depth, dtype=np.float64),
+        np.asarray(dist_coeffs, dtype=np.float64).reshape(-1),
+    ).reshape(-1, 2)
+    x = norm[:, 0] * z
+    y = norm[:, 1] * z
     return np.stack([x, y, z], axis=1), (ys, xs)
 
 
@@ -319,6 +348,7 @@ def _ring_table_z_fallback(
     t_world_camera: Optional[np.ndarray],
     ring_px: int,
     min_ring_pixels: int,
+    dist_coeffs: Optional[np.ndarray] = None,
 ) -> Optional[float]:
     ring_px = int(max(1, ring_px))
     kernel = np.ones((ring_px * 2 + 1, ring_px * 2 + 1), dtype=np.uint8)
@@ -327,7 +357,7 @@ def _ring_table_z_fallback(
     valid_ring = ring & np.isfinite(depth) & (depth > 0.0)
     if int(np.count_nonzero(valid_ring)) < int(min_ring_pixels):
         return None
-    pts_cam, _ = _unproject_valid(depth, valid_ring, k_depth)
+    pts_cam, _ = _unproject_valid(depth, valid_ring, k_depth, dist_coeffs=dist_coeffs)
     if pts_cam.shape[0] == 0:
         return None
     if t_world_camera is not None:
@@ -344,15 +374,30 @@ def localize_objects_rgbd(
     settings: Optional[RgbdLocalizerSettings] = None,
     table_plane: Optional[TablePlane] = None,
     known_dims: Optional[tuple[float, float, float]] = None,
+    lens_calibration: Optional[LensCalibration] = None,
 ) -> list[ObjectPoseOutput]:
     """`known_dims` = (base_radius_m, rim_radius_m, height_m); when given, the
     object's size is taken as supplied and the axis center is recovered with the
-    known-cone fit (de-biased), instead of estimated from the sparse depth cloud."""
+    known-cone fit (de-biased), instead of estimated from the sparse depth cloud.
+
+    `lens_calibration` (opt-in): if supplied, the localizer uses the refined K
+    and the lens distortion model for depth unprojection. Default `None`
+    preserves the prior pinhole behaviour for all existing callers."""
     cfg = settings or RgbdLocalizerSettings()
     rgb_h, rgb_w = packet.rgb.shape[:2]
     depth_h, depth_w = packet.depth.shape[:2]
+    # Choose the intrinsics for unprojection. With a lens calibration we use
+    # `K_refined` (camera-intrinsic, focus-aware to the extent it was captured
+    # at the working distance); without it we fall back to Record3D's K, which
+    # is what the pipeline assumed historically.
+    if lens_calibration is not None:
+        k_rgb = lens_calibration.k_for_resolution(rgb_w, rgb_h)
+        dist_coeffs: Optional[np.ndarray] = lens_calibration.dist_array()
+    else:
+        k_rgb = np.asarray(packet.intrinsic_mat, dtype=np.float64)
+        dist_coeffs = None
     k_depth = scale_intrinsics_for_shape(
-        packet.intrinsic_mat, rgb_shape=(rgb_h, rgb_w), target_shape=(depth_h, depth_w)
+        k_rgb, rgb_shape=(rgb_h, rgb_w), target_shape=(depth_h, depth_w)
     )
 
     plane_normal: Optional[np.ndarray] = None
@@ -380,7 +425,9 @@ def localize_objects_rgbd(
         if int(np.count_nonzero(valid)) < int(cfg.min_depth_pixels):
             continue
 
-        pts_cam, (ys, xs) = _unproject_valid(packet.depth, valid, k_depth)
+        pts_cam, (ys, xs) = _unproject_valid(
+            packet.depth, valid, k_depth, dist_coeffs=dist_coeffs,
+        )
         if pts_cam.shape[0] < int(cfg.min_depth_pixels):
             continue
 
@@ -460,6 +507,7 @@ def localize_objects_rgbd(
                 t_world_camera=t_world_camera if in_world else None,
                 ring_px=cfg.table_ring_px,
                 min_ring_pixels=cfg.min_table_ring_pixels,
+                dist_coeffs=dist_coeffs,
             )
             z_lo = _weighted_percentile(pts[:, 2], w_per_pt, cfg.object_base_percentile)
             z_hi = _weighted_percentile(pts[:, 2], w_per_pt, cfg.object_top_percentile)
