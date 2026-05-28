@@ -572,6 +572,15 @@ def main() -> None:
             # Angled: the tool-collision guard must be on, and we auto-search the
             # approach azimuth for one the arm can actually reach (probed, no motion).
             ctx.settings.enable_collision_check = True
+            # The angled grasp needs the FULL orientation enforced — fingers LEVEL
+            # (both at the same height) and the servo bump UP/back. ik_orient Z only
+            # pins the approach axis and leaves the roll free, which twisted the
+            # servo toward the camera and tipped the cup. Force full-orientation IK.
+            if ctx.settings.ik_orientation_mode != "all":
+                print("[pick_place] angled grasp: forcing full-orientation IK "
+                      "(ik_orient=all) so fingers stay level and the servo points up")
+                ctx.settings.ik_orientation_mode = "all"
+                ctx.ik_solver = None  # rebuild the solver in 'all' mode
             print(f"[pick_place] searching approach azimuths (tilt {args.approach_tilt_deg:.0f}°)...")
             grasp_plan, chosen = _search_feasible_angled_plan(
                 cup_world, radius_m, base_radius_m, obj_height_m, n_world, o_world,
