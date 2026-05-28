@@ -53,8 +53,10 @@ from perception.control import (
     descend_and_grasp,
     is_reachable,
     lift,
+    orientation_rpy_for_approach,
     place,
     pre_grasp,
+    probe_pose,
     retreat_along_approach,
     safe_home,
 )
@@ -118,6 +120,45 @@ def _approach_yaw_toward_base(cup_world_m: np.ndarray, ctx) -> float:
     if np.linalg.norm(h) < 1e-6:
         return 0.0
     return float(np.arctan2(np.dot(h, v), np.dot(h, u)))
+
+
+def _search_feasible_angled_plan(
+    cup_world, radius_m, base_radius_m, obj_height_m,
+    n_world, o_world, gripper_geom, ctx, tilt_deg, standoff_m, seed_angles,
+):
+    """Try approach azimuths around the cup; return the first plan whose pre-grasp
+    AND grasp poses are IK-solvable and collision-free (probed without moving), or
+    None. The user has given freedom on approach direction, so we auto-pick one the
+    280 can actually reach."""
+    from perception.control.grasp_planner import GraspPlannerSettings, plan_grasp
+
+    base_yaw = _approach_yaw_toward_base(cup_world, ctx)
+    # Spread of azimuths to try, relative to the radial-toward-base heading.
+    candidates_deg = [0, 180, 90, -90, 45, -45, 135, -135]
+    for dyaw in candidates_deg:
+        yaw = base_yaw + np.radians(dyaw)
+        plan = plan_grasp(
+            axis_center_world_m=cup_world, height_m=obj_height_m,
+            radius_m=radius_m, base_radius_m=base_radius_m,
+            plane_normal_world=n_world, plane_origin_world=o_world,
+            gripper=gripper_geom,
+            settings=GraspPlannerSettings(approach_tilt_deg=float(tilt_deg),
+                                          approach_yaw_rad=float(yaw),
+                                          standoff_m=float(standoff_m)),
+        )
+        rpy = orientation_rpy_for_approach(plan.approach_dir_world, ctx)
+        pg_ik, pg_err, pg_col, pg_clr = probe_pose(
+            plan.pregrasp_point_world_m, rpy, ctx, seed_angles_deg=seed_angles)
+        g_ik, g_err, g_col, g_clr = probe_pose(
+            plan.grasp_point_world_m, rpy, ctx, seed_angles_deg=seed_angles)
+        feasible = pg_ik and g_ik and pg_col and g_col
+        print(f"[pick_place]   azimuth {dyaw:+4d}°: "
+              f"pregrasp ik={'ok' if pg_ik else 'FAIL'}({pg_err:.0f}mm) clr={pg_clr*1000:.0f}mm  "
+              f"grasp ik={'ok' if g_ik else 'FAIL'}({g_err:.0f}mm) clr={g_clr*1000:.0f}mm  "
+              f"-> {'FEASIBLE' if feasible else 'no'}")
+        if feasible:
+            return plan, dyaw
+    return None, None
 
 
 @dataclass
@@ -511,28 +552,38 @@ def main() -> None:
             max_gap_m=float(args.gripper_max_gap_mm) * 1e-3,
             grip_clearance_m=float(args.grip_clearance_mm) * 1e-3,
         )
-        planner_settings = GraspPlannerSettings(
-            approach_tilt_deg=float(args.approach_tilt_deg),
-            approach_yaw_rad=_approach_yaw_toward_base(cup_world, ctx),
-            standoff_m=float(args.standoff_mm) * 1e-3,
-        )
+        # First check feasibility/mode with a straight-down probe plan.
         try:
-            grasp_plan = plan_grasp(
-                axis_center_world_m=cup_world,
-                height_m=obj_height_m,
-                radius_m=radius_m,
-                base_radius_m=base_radius_m,
-                plane_normal_world=n_world,
-                plane_origin_world=o_world,
+            probe_plan = plan_grasp(
+                axis_center_world_m=cup_world, height_m=obj_height_m,
+                radius_m=radius_m, base_radius_m=base_radius_m,
+                plane_normal_world=n_world, plane_origin_world=o_world,
                 gripper=gripper_geom,
-                settings=planner_settings,
+                settings=GraspPlannerSettings(approach_tilt_deg=float(args.approach_tilt_deg),
+                                              standoff_m=float(args.standoff_mm) * 1e-3),
             )
         except GraspInfeasible as exc:
             print(f"[pick_place] ABORT: object not graspable: {exc}")
             sys.exit(5)
-        # Angled approaches need the tool-collision guard active.
-        if grasp_plan.mode == "angled":
+
+        if probe_plan.mode == "top_down":
+            grasp_plan = probe_plan  # fits the open gripper from above; no search needed
+        else:
+            # Angled: the tool-collision guard must be on, and we auto-search the
+            # approach azimuth for one the arm can actually reach (probed, no motion).
             ctx.settings.enable_collision_check = True
+            print(f"[pick_place] searching approach azimuths (tilt {args.approach_tilt_deg:.0f}°)...")
+            grasp_plan, chosen = _search_feasible_angled_plan(
+                cup_world, radius_m, base_radius_m, obj_height_m, n_world, o_world,
+                gripper_geom, ctx, float(args.approach_tilt_deg),
+                float(args.standoff_mm) * 1e-3, seed_angles=[0.0, -30.0, -30.0, 0.0, 0.0, -45.0],
+            )
+            if grasp_plan is None:
+                print(f"[pick_place] ABORT: no reachable angled approach at tilt "
+                      f"{args.approach_tilt_deg:.0f}°. Try a lower --approach-tilt-deg "
+                      f"(e.g. 20) or move the cup closer to the base.")
+                sys.exit(5)
+            print(f"[pick_place] chose approach azimuth {chosen:+d}° (relative to base radial).")
     else:
         reason = ("--force-top-down" if args.force_top_down
                   else "no object dimensions (supply --object-rim-mm/--object-height-mm "

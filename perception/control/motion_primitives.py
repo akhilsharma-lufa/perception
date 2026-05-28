@@ -251,6 +251,48 @@ def collision_check(
     return (min_clear >= float(ctx.settings.table_clearance_m)), min_clear
 
 
+def flange_pose_for_world(
+    p_world_m: Sequence[float],
+    rpy_deg: Sequence[float],
+    ctx: MotionContext,
+) -> np.ndarray:
+    """Robot-frame flange position that puts the tool tip at `p_world_m` with the
+    given RPY (the same computation `move_to_world` commands). Lets callers probe a
+    pose without moving the arm."""
+    p_robot_tip = world_to_robot(p_world_m, ctx.t_robot_world)
+    r = _rpy_to_rotation_matrix(rpy_deg)
+    off_x, off_y = ctx.settings.tip_offset_tool0_xy_m
+    off = np.array([float(off_x), float(off_y), float(ctx.settings.tip_offset_z_m)], dtype=np.float64)
+    return p_robot_tip - r @ off
+
+
+def probe_pose(
+    p_world_m: Sequence[float],
+    rpy_deg: Sequence[float],
+    ctx: MotionContext,
+    seed_angles_deg: Optional[Sequence[float]] = None,
+) -> tuple[bool, float, bool, float]:
+    """Check whether a tool pose is reachable + collision-free WITHOUT moving.
+
+    Returns (ik_ok, ik_err_mm, collision_ok, clearance_m). When the IK path is
+    enabled it runs the solver (catching IKSolveError); otherwise ik_ok=True.
+    """
+    flange = flange_pose_for_world(p_world_m, rpy_deg, ctx)
+    if ctx.settings.tool_collision_boxes:
+        coll_ok, clearance = collision_check(flange, rpy_deg, ctx)
+    else:
+        coll_ok, clearance = True, float("inf")
+    ik_ok, ik_err = True, 0.0
+    if ctx.settings.use_ik_solver:
+        try:
+            _, ik_err = ctx.get_ik_solver().solve_flange(
+                flange, rpy_deg, seed_angles_deg=seed_angles_deg
+            )
+        except Exception:
+            ik_ok, ik_err = False, float("inf")
+    return ik_ok, float(ik_err), coll_ok, float(clearance)
+
+
 def project_above_table(
     p_world_m: Sequence[float],
     height_above_table_m: float,
