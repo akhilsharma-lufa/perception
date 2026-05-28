@@ -332,6 +332,18 @@ def main() -> None:
                         help="Tilt from vertical for the angled approach (0=top-down, 90=horizontal).")
     parser.add_argument("--standoff-mm", type=float, default=60.0,
                         help="Pre-grasp standoff distance back along the approach axis (mm).")
+    parser.add_argument("--object-rim-mm", type=float, default=None,
+                        help="Override: object's max/rim diameter (mm). When set (with "
+                             "--object-height-mm), the grasp uses these SUPPLIED dimensions "
+                             "and perception provides position only. Reliable for a known "
+                             "object when depth-based sizing is unreliable. General: pass the "
+                             "dims of whatever you're picking.")
+    parser.add_argument("--object-base-mm", type=float, default=None,
+                        help="Override: object's base diameter (mm). Defaults to --object-rim-mm "
+                             "(cylinder) if omitted.")
+    parser.add_argument("--object-height-mm", type=float, default=None,
+                        help="Override: object height above the table (mm). Required to use the "
+                             "supplied-dimensions path.")
     parser.add_argument("--force-top-down", action="store_true",
                         help="Skip the planner's angled decision and force a vertical grasp "
                              "(only safe when the object fits the open gripper from above).")
@@ -462,9 +474,25 @@ def main() -> None:
               "Try --place-mm 100 70 0 (board center).")
         sys.exit(3)
 
+    # --- Object dimensions: supplied override (reliable) or perceived model --
+    if args.object_rim_mm is not None and args.object_height_mm is not None:
+        radius_m = float(args.object_rim_mm) * 0.5e-3
+        base_mm = args.object_base_mm if args.object_base_mm is not None else args.object_rim_mm
+        base_radius_m = float(base_mm) * 0.5e-3
+        obj_height_m = float(args.object_height_mm) * 1e-3
+        print(f"[pick_place] using SUPPLIED object dims: rim Ø{args.object_rim_mm:.0f} "
+              f"base Ø{base_mm:.0f} height {args.object_height_mm:.0f} mm "
+              f"(perception -> position only)")
+    elif obs.radius_m is not None and obs.height_m is not None:
+        radius_m = float(obs.radius_m)
+        base_radius_m = obs.base_radius_m
+        obj_height_m = float(obs.height_m)
+    else:
+        radius_m = base_radius_m = obj_height_m = None
+
     # --- Grasp planning: object model -> grasp + approach ------------------
     grasp_plan = None
-    if obs.radius_m is not None and obs.height_m is not None and not args.force_top_down:
+    if radius_m is not None and not args.force_top_down:
         n_world, o_world = profile.table_plane.as_arrays()
         gripper_geom = GripperGeom(
             min_gap_m=float(args.gripper_min_gap_mm) * 1e-3,
@@ -479,9 +507,9 @@ def main() -> None:
         try:
             grasp_plan = plan_grasp(
                 axis_center_world_m=cup_world,
-                height_m=float(obs.height_m),
-                radius_m=float(obs.radius_m),
-                base_radius_m=obs.base_radius_m,
+                height_m=obj_height_m,
+                radius_m=radius_m,
+                base_radius_m=base_radius_m,
                 plane_normal_world=n_world,
                 plane_origin_world=o_world,
                 gripper=gripper_geom,
@@ -495,7 +523,8 @@ def main() -> None:
             ctx.settings.enable_collision_check = True
     else:
         reason = ("--force-top-down" if args.force_top_down
-                  else "no object model (radius/height) from perception")
+                  else "no object dimensions (supply --object-rim-mm/--object-height-mm "
+                       "or rely on perception)")
         print(f"[pick_place] no grasp plan ({reason}); using legacy top-down sequence.")
 
     print(f"[pick_place] PLAN:")
