@@ -390,7 +390,14 @@ def localize_objects_rgbd(
         if cfg.depth_consistency_max_extent_m > 0.0:
             zs = pts_cam[:, 2]
             z_front = float(np.percentile(zs, float(cfg.depth_consistency_front_percentile)))
-            z_max_allowed = z_front + float(cfg.depth_consistency_max_extent_m)
+            # When the object's height is known, ensure the depth-extent gate is
+            # at least the known height (×1.2 margin) so a misidentified `z_front`
+            # (e.g. a specular reflection on a glossy cup) cannot crop out the
+            # base and shrink the perceived height.
+            extent = float(cfg.depth_consistency_max_extent_m)
+            if known_dims is not None:
+                extent = max(extent, 1.2 * float(known_dims[2]))
+            z_max_allowed = z_front + extent
             keep = zs <= z_max_allowed
             keep_ratio = float(keep.sum()) / float(zs.size)
             if (
