@@ -116,10 +116,20 @@ def _board_pose_initial(
     return err, normal_cam
 
 
-def _cell_index(u: float, v: float, w: int, h: int, grid: int = 3) -> Tuple[int, int]:
+def _cell_index(u: float, v: float, w: int, h: int, grid: int = 5) -> Tuple[int, int]:
     cx = min(int(grid * u / max(1, w)), grid - 1)
     cy = min(int(grid * v / max(1, h)), grid - 1)
     return cy, cx  # (row, col)
+
+
+def _max_corner_radius_norm(img_pts: np.ndarray, w: int, h: int) -> float:
+    """Maximum normalised radial distance of any detected corner from image
+    centre. We use this to prefer-accept frames whose corners reach the
+    outer rings (>0.6), which constrain k2/k3."""
+    cu, cv = 0.5 * float(w), 0.5 * float(h)
+    half_diag = math.hypot(cu, cv)
+    r = np.sqrt((img_pts[:, 0] - cu) ** 2 + (img_pts[:, 1] - cv) ** 2)
+    return float(np.max(r) / max(1e-9, half_diag))
 
 
 def _tilt_bin(tilt_deg: float, edges: Tuple[float, ...]) -> int:
@@ -195,10 +205,13 @@ def main() -> None:
     p.add_argument("--target-captures", type=int, default=20,
                    help="Stop once this many captures are collected.")
     p.add_argument("--min-corners", type=int, default=20)
-    p.add_argument("--max-initial-reproj-px", type=float, default=2.0,
+    p.add_argument("--max-initial-reproj-px", type=float, default=6.0,
                    help="Reject frames where pinhole-only PnP already overshoots "
-                        "this — they're likely blurry, partial, or wildly tilted.")
-    p.add_argument("--min-laplacian-var", type=float, default=80.0,
+                        "this. We deliberately allow large values here because a "
+                        "lens with real distortion produces 1-3 px PnP residuals at "
+                        "the image edges — exactly the frames we need. The final "
+                        "cv2.calibrateCamera LM solve is robust to noisy PnP-init.")
+    p.add_argument("--min-laplacian-var", type=float, default=50.0,
                    help="Reject blurry frames (variance of Laplacian).")
     p.add_argument("--inter-capture-s", type=float, default=0.8,
                    help="Minimum seconds between consecutive auto-captures, so "
@@ -219,8 +232,12 @@ def main() -> None:
 
     tilt_edges = (10.0, 25.0, 40.0)  # 4 bins: <=10, (10,25], (25,40], >40 deg
     n_tilt_bins = len(tilt_edges) + 1
+    grid_n = 5  # 5x5 image-cell coverage (25 cells)
+    radial_edges = (0.4, 0.6, 0.8, 1.0)  # rings of normalised radius
+    n_radial_bins = len(radial_edges)
     cells_seen: set[tuple[int, int]] = set()
     tilts_seen: set[int] = set()
+    radial_seen: set[int] = set()
     captures: List[Capture] = []
     image_size: Optional[Tuple[int, int]] = None
     k_initial: Optional[np.ndarray] = None
@@ -266,14 +283,20 @@ def main() -> None:
             # of the board's +Z to the camera's +Z. Big tilt = larger angle.
             u_c = float(np.mean(img_pts[:, 0]))
             v_c = float(np.mean(img_pts[:, 1]))
-            cell = _cell_index(u_c, v_c, w, h, grid=3)
+            cell = _cell_index(u_c, v_c, w, h, grid=grid_n)
             tilt_deg = float(np.degrees(math.acos(min(1.0, abs(float(normal_cam[2]))))))
             tbin = _tilt_bin(tilt_deg, tilt_edges)
+            # Outermost radial ring any corner of this frame reaches. Captures
+            # that touch a fresh ring (especially r in [0.6,1.0)) constrain
+            # k2/k3 — accept them even if the centroid cell is "used".
+            r_max = _max_corner_radius_norm(img_pts, w, h)
+            rbin = min(int(_tilt_bin(r_max, radial_edges)), n_radial_bins - 1)
 
             now = time.monotonic()
             new_cell = cell not in cells_seen
             new_tilt = tbin not in tilts_seen
-            if not (new_cell or new_tilt):
+            new_radial = rbin not in radial_seen
+            if not (new_cell or new_tilt or new_radial):
                 continue
             if now - last_capture_t < float(args.inter_capture_s):
                 continue
@@ -285,12 +308,15 @@ def main() -> None:
             ))
             cells_seen.add(cell)
             tilts_seen.add(tbin)
+            radial_seen.add(rbin)
             last_capture_t = now
             print(f"  [{len(captures):2d}/{int(args.target_captures)}] "
-                  f"cell={cell}  tilt={tilt_deg:5.1f}°  "
+                  f"cell={cell}  tilt={tilt_deg:5.1f}°  r_max={r_max:.2f}  "
                   f"reproj(pinhole)={reproj:.2f}px  "
                   f"corners={img_pts.shape[0]}  sharp={lap:.0f}  "
-                  f"cells={len(cells_seen)}/9  tilts={len(tilts_seen)}/{n_tilt_bins}")
+                  f"cells={len(cells_seen)}/{grid_n*grid_n}  "
+                  f"tilts={len(tilts_seen)}/{n_tilt_bins}  "
+                  f"radial_rings={len(radial_seen)}/{n_radial_bins}")
     except KeyboardInterrupt:
         print("\n  interrupted by user.")
     finally:
@@ -300,14 +326,19 @@ def main() -> None:
         print(f"\nERROR: only {len(captures)} usable captures; need >= 8.",
               file=sys.stderr)
         sys.exit(3)
-    print(f"\ncollected {len(captures)} captures; cells={len(cells_seen)}/9; "
-          f"tilts={len(tilts_seen)}/{n_tilt_bins}.")
-    if len(cells_seen) < 5:
-        print("  WARNING: <5 image cells covered — calibration may be biased. "
-              "Re-run and place the board in more frame corners.")
+    print(f"\ncollected {len(captures)} captures; "
+          f"cells={len(cells_seen)}/{grid_n*grid_n}; "
+          f"tilts={len(tilts_seen)}/{n_tilt_bins}; "
+          f"radial_rings={len(radial_seen)}/{n_radial_bins}.")
+    if len(cells_seen) < 8:
+        print("  WARNING: <8 image cells covered — calibration may be biased. "
+              "Re-run and place the board in more frame regions.")
     if len(tilts_seen) < 3:
         print("  WARNING: <3 tilt bins covered — focal length and depth are "
               "weakly disambiguated. Re-run with more board tilt.")
+    if len(radial_seen) < 3 or max(radial_seen) < 2:
+        print("  WARNING: outer radial rings under-sampled — k2/k3 are weakly "
+              "constrained. Push the board further toward the image corners.")
 
     obj_pts_list = [c.obj_pts.astype(np.float32) for c in captures]
     img_pts_list = [c.img_pts.astype(np.float32) for c in captures]
@@ -366,6 +397,7 @@ def main() -> None:
         "n_captures": len(captures),
         "cells_covered": sorted(list(cells_seen)),
         "tilts_covered": sorted(list(tilts_seen)),
+        "radial_rings_covered": sorted(list(radial_seen)),
         "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     out_path.write_text(json.dumps(payload, indent=2))
