@@ -140,6 +140,7 @@ def _observe_cup(
     target_label: str,
     min_confidence: float,
     window_s: float,
+    known_dims: tuple[float, float, float] | None = None,
 ) -> CupObservation | None:
     """Run detection for `window_s` seconds; return a `CupObservation` for the best
     matching target, or None if no candidate.
@@ -181,6 +182,7 @@ def _observe_cup(
             t_world_camera=t_world_camera,
             settings=localizer_cfg,
             table_plane=table_plane,
+            known_dims=known_dims,
         )
 
         # Pair outputs back to detections via "label_index" in object_id.
@@ -391,6 +393,15 @@ def main() -> None:
           f"marker={board_cfg.marker_length_m*1000:.1f}mm "
           f"dict={board_cfg.dictionary_name} legacy={board_cfg.legacy_pattern}")
 
+    # Supplied object dimensions -> (base_radius_m, rim_radius_m, height_m). When
+    # given, perception uses them to size the object AND to recover a de-biased
+    # axis center (known-cone fit), so the detected position needs no --xy-bias.
+    known_dims = None
+    if args.object_rim_mm is not None and args.object_height_mm is not None:
+        base_mm = args.object_base_mm if args.object_base_mm is not None else args.object_rim_mm
+        known_dims = (float(base_mm) * 0.5e-3, float(args.object_rim_mm) * 0.5e-3,
+                      float(args.object_height_mm) * 1e-3)
+
     # --- Detection-only setup ---------------------------------------------
     classes_raw = str(args.classes).strip()
     class_whitelist = None
@@ -431,6 +442,7 @@ def main() -> None:
             target_label=str(args.target_label),
             min_confidence=float(args.min_confidence),
             window_s=float(args.detection_window_s),
+            known_dims=known_dims,
         )
         if result is None:
             print(f"[pick_place] ABORT: no '{args.target_label}' detection.")

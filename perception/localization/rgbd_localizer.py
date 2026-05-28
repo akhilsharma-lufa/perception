@@ -166,6 +166,53 @@ def _fit_circle_2d(xy: np.ndarray) -> Optional[tuple[float, float, float]]:
     return float(cx), float(cy), float(np.sqrt(r2))
 
 
+def _fit_axis_known_profile(
+    footprint_uv: np.ndarray,
+    heights_m: np.ndarray,
+    base_radius_m: float,
+    rim_radius_m: float,
+    total_height_m: float,
+    init_center: tuple[float, float],
+    iters: int = 20,
+) -> tuple[float, float]:
+    """De-biased axis center for an object of KNOWN cone profile.
+
+    Each point at height h should lie at distance r(h) = base + (rim-base)*h/H from
+    the axis. We solve for the axis center C (in plane coords) minimizing
+    Σ(|p_i - C| - r(h_i))² by Gauss-Newton. Because the radius is known, this pins
+    the true center even from a partial near-side arc — unlike a free-radius fit or
+    a centroid, both of which are pulled toward the camera-facing half.
+    """
+    fp = np.asarray(footprint_uv, dtype=np.float64).reshape(-1, 2)
+    h = np.asarray(heights_m, dtype=np.float64).reshape(-1)
+    if fp.shape[0] < 3:
+        return float(init_center[0]), float(init_center[1])
+    if total_height_m > 1e-6:
+        frac = np.clip(h / total_height_m, 0.0, 1.0)
+    else:
+        frac = np.zeros_like(h)
+    r_exp = base_radius_m + (rim_radius_m - base_radius_m) * frac
+    C = np.array(init_center, dtype=np.float64)
+    for _ in range(int(iters)):
+        diff = fp - C
+        d = np.linalg.norm(diff, axis=1)
+        good = d > 1e-6
+        if int(good.sum()) < 3:
+            break
+        e = diff[good] / d[good, None]          # unit vectors C -> point
+        f = d[good] - r_exp[good]               # residuals (too far if > 0)
+        jtj = e.T @ e                           # 2x2
+        jtf = e.T @ f                           # 2
+        try:
+            dC = np.linalg.solve(jtj, jtf)
+        except np.linalg.LinAlgError:
+            break
+        C = C + dC
+        if float(np.linalg.norm(dC)) < 1e-5:
+            break
+    return float(C[0]), float(C[1])
+
+
 def _slice_radius(
     footprint_uv: np.ndarray,
     center_uv: tuple[float, float],
@@ -192,14 +239,19 @@ def _fit_object_model(
     plane_origin: np.ndarray,
     height_m: float,
     cfg: "RgbdLocalizerSettings",
+    known_dims: Optional[tuple[float, float, float]] = None,
 ) -> Optional[tuple[np.ndarray, float, float]]:
     """Fit an upright solid to the object's points on the table plane.
 
     Returns (axis_center_world_xyz, radius_m, base_radius_m) or None if there is
     not enough geometry. `axis_center_world` is the de-biased object axis projected
     onto the table plane; `radius_m` is the max (rim) radius — the collision bound;
-    `base_radius_m` is a low slice's radius. Recovering the center from a circle fit
-    removes the camera-facing-half bias of a raw centroid.
+    `base_radius_m` is a low slice's radius.
+
+    `known_dims` = (base_radius_m, rim_radius_m, total_height_m). When given, the
+    center is recovered with a KNOWN-cone fit (each point pinned to its expected
+    radius), which de-biases the camera-facing-half offset far more reliably than a
+    free-radius fit, and the returned radii are the supplied ones.
     """
     u, v = _plane_basis(plane_normal)
     origin = np.asarray(plane_origin, dtype=np.float64).reshape(3)
@@ -208,6 +260,18 @@ def _fit_object_model(
     uu = rel @ u
     vv = rel @ v
     footprint = np.column_stack([uu, vv])
+
+    if known_dims is not None:
+        base_r, rim_r, total_h = (float(known_dims[0]), float(known_dims[1]), float(known_dims[2]))
+        w = np.clip(weights, 0.0, None)
+        wsum = float(np.sum(w))
+        if wsum > 0.0:
+            init = (float(np.sum(w * uu) / wsum), float(np.sum(w * vv) / wsum))
+        else:
+            init = (float(np.mean(uu)), float(np.mean(vv)))
+        cu, cv = _fit_axis_known_profile(footprint, h, base_r, rim_r, total_h, init)
+        axis_center_world = origin + cu * u + cv * v
+        return axis_center_world, rim_r, base_r
 
     # Rim slice = the widest part. For a cup that's the top; for a cone narrowing
     # upward it's the base. Fit a circle there to get the axis center + max radius.
@@ -279,7 +343,11 @@ def localize_objects_rgbd(
     t_world_camera: np.ndarray | None,
     settings: Optional[RgbdLocalizerSettings] = None,
     table_plane: Optional[TablePlane] = None,
+    known_dims: Optional[tuple[float, float, float]] = None,
 ) -> list[ObjectPoseOutput]:
+    """`known_dims` = (base_radius_m, rim_radius_m, height_m); when given, the
+    object's size is taken as supplied and the axis center is recovered with the
+    known-cone fit (de-biased), instead of estimated from the sparse depth cloud."""
     cfg = settings or RgbdLocalizerSettings()
     rgb_h, rgb_w = packet.rgb.shape[:2]
     depth_h, depth_w = packet.depth.shape[:2]
@@ -357,13 +425,19 @@ def localize_objects_rgbd(
             signed = (pts - plane_origin) @ plane_normal
             top = _weighted_percentile(signed, w_per_pt, cfg.object_top_percentile)
             height_m = float(max(0.0, top))
-            # Fit an upright solid: de-biased axis center (circle fit beats a
-            # camera-half centroid) + max (rim) radius + base radius.
+            # When dimensions are supplied, trust them (depth-based sizing is
+            # unreliable for small glossy objects) and report the supplied height.
+            model_height = float(known_dims[2]) if known_dims is not None else height_m
+            # Fit an upright solid: de-biased axis center + radii. With known_dims
+            # the center comes from the known-cone fit (robustly de-biased).
             model = _fit_object_model(
-                pts, w_per_pt, plane_normal, plane_origin, height_m, cfg
+                pts, w_per_pt, plane_normal, plane_origin, model_height, cfg,
+                known_dims=known_dims,
             )
             if model is not None:
                 axis_center_world, radius_m, base_radius_m = model
+                if known_dims is not None:
+                    height_m = float(known_dims[2])
                 # Replace XY with the de-biased axis; keep centroid Z for display
                 # (downstream grasp planning re-projects onto the table plane).
                 position = (
